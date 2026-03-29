@@ -214,14 +214,16 @@ void LookForBearishM5BOS()
 //+------------------------------------------------------------------+
 //| M5 Bullish entry sequence                                        |
 //| 1. Wait for pullback – any M5 bar closes below the BOS close    |
-//| 2. Entry – next M5 candle closes above the previous bar's high  |
+//| 2. Entry – next M5 candle body closes above the previous body   |
 //| 3. Stop loss – below the entry candle low (+ buffer)            |
 //+------------------------------------------------------------------+
 void CheckBullishEntry()
 {
    double cl1 = iClose(Symbol(), PERIOD_M5, 1);
-   double hi2 = iHigh (Symbol(), PERIOD_M5, 2);
    double lo1 = iLow  (Symbol(), PERIOD_M5, 1);
+
+   // Top of the previous candle's body (ignores the wick)
+   double body_top2 = MathMax(iOpen(Symbol(), PERIOD_M5, 2), iClose(Symbol(), PERIOD_M5, 2));
 
    // Step 1 – detect pullback after BOS
    if (!g_pullback_seen)
@@ -234,8 +236,8 @@ void CheckBullishEntry()
       return;
    }
 
-   // Step 2 – entry confirmation: bar closes above the previous bar's high
-   if (cl1 > hi2)
+   // Step 2 – entry confirmation: candle body closes above the previous candle's body top
+   if (cl1 > body_top2)
    {
       double sl   = lo1 - InpSLBufferPips * g_pip;
       double lots = CalculateLots(Ask - sl);
@@ -267,14 +269,16 @@ void CheckBullishEntry()
 //+------------------------------------------------------------------+
 //| M5 Bearish entry sequence                                        |
 //| 1. Wait for pullback – any M5 bar closes above the BOS close    |
-//| 2. Entry – next M5 candle closes below the previous bar's low   |
+//| 2. Entry – next M5 candle body closes below the previous body   |
 //| 3. Stop loss – above the entry candle high (+ buffer)           |
 //+------------------------------------------------------------------+
 void CheckBearishEntry()
 {
    double cl1 = iClose(Symbol(), PERIOD_M5, 1);
-   double lo2 = iLow  (Symbol(), PERIOD_M5, 2);
    double hi1 = iHigh (Symbol(), PERIOD_M5, 1);
+
+   // Bottom of the previous candle's body (ignores the wick)
+   double body_bot2 = MathMin(iOpen(Symbol(), PERIOD_M5, 2), iClose(Symbol(), PERIOD_M5, 2));
 
    // Step 1 – detect pullback after BOS
    if (!g_pullback_seen)
@@ -287,8 +291,8 @@ void CheckBearishEntry()
       return;
    }
 
-   // Step 2 – entry confirmation: bar closes below the previous bar's low
-   if (cl1 < lo2)
+   // Step 2 – entry confirmation: candle body closes below the previous candle's body bottom
+   if (cl1 < body_bot2)
    {
       double sl   = hi1 + InpSLBufferPips * g_pip;
       double lots = CalculateLots(sl - Bid);
