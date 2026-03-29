@@ -8,8 +8,9 @@
 //|     • Bearish bias  – H1 candle closes BELOW a prior swing low   |
 //|                                                                  |
 //|  2. M5 Entry:                                                    |
-//|     a. Wait for 5-min price to retrace into the H1 leg           |
-//|        (swing structure naturally forms during the retrace).     |
+//|     a. Wait for H1 retrace – confirmed by EITHER:               |
+//|        • An M5 candle body closing past the H1 BOS candle wick  |
+//|        • Two consecutive M5 candles in the opposite direction    |
 //|     b. Detect the first 5-min Break of Structure (BOS) in the   |
 //|        same direction as the H1 bias.                            |
 //|     c. After the M5 BOS, wait for price to pull back.           |
@@ -36,12 +37,14 @@ input string InpComment       = "MTF";
 //--- State machine
 enum EState
 {
-   STATE_IDLE,        // No bias – scanning H1
-   STATE_BULL,        // H1 bullish bias active, scanning M5 for BOS
-   STATE_BEAR,        // H1 bearish bias active, scanning M5 for BOS
-   STATE_BULL_BOS,    // M5 bullish BOS confirmed, awaiting pullback then entry
-   STATE_BEAR_BOS,    // M5 bearish BOS confirmed, awaiting pullback then entry
-   STATE_IN_TRADE     // Position is open
+   STATE_IDLE,           // No bias – scanning H1
+   STATE_BULL_RETRACE,   // H1 bullish bias set, awaiting H1 retrace confirmation
+   STATE_BEAR_RETRACE,   // H1 bearish bias set, awaiting H1 retrace confirmation
+   STATE_BULL,           // H1 retrace confirmed, scanning M5 for bullish BOS
+   STATE_BEAR,           // H1 retrace confirmed, scanning M5 for bearish BOS
+   STATE_BULL_BOS,       // M5 bullish BOS confirmed, awaiting pullback then entry
+   STATE_BEAR_BOS,       // M5 bearish BOS confirmed, awaiting pullback then entry
+   STATE_IN_TRADE        // Position is open
 };
 
 //--- Global variables
@@ -51,8 +54,14 @@ datetime g_m5_bar_time   = 0;
 double   g_pip           = 0;
 
 // H1 structure levels recorded at the time of bias detection
-double   g_h1_swing_high = 0;
-double   g_h1_swing_low  = 0;
+double   g_h1_swing_high     = 0;
+double   g_h1_swing_low      = 0;
+
+// H1 retrace tracking
+// Bullish: lower wick of the H1 BOS candle – body must close below this
+// Bearish: upper wick of the H1 BOS candle – body must close above this
+double   g_h1_retrace_level  = 0;
+int      g_retrace_bar_count = 0;  // consecutive opposite-direction M5 bars
 
 // M5 BOS details
 double   g_bos_close     = 0;  // Close of the M5 candle that created the BOS
@@ -117,35 +126,47 @@ void CheckH1Bias()
    //--- Bullish BOS: H1 candle closes above a prior swing high
    if (sh > 0 && cl1 > sh)
    {
-      if (g_state == STATE_IDLE || g_state == STATE_BEAR || g_state == STATE_BEAR_BOS)
+      if (g_state == STATE_IDLE || g_state == STATE_BEAR        ||
+          g_state == STATE_BEAR_RETRACE || g_state == STATE_BEAR_BOS)
       {
-         g_state         = STATE_BULL;
-         g_h1_swing_high = sh;
-         g_pullback_seen = false;
-         Print("H1 Bullish BOS | Swing High: ", sh, " | H1 Close: ", cl1);
+         g_state              = STATE_BULL_RETRACE;
+         g_h1_swing_high      = sh;
+         // Lower wick of the BOS candle is the retrace reference level
+         g_h1_retrace_level   = iLow(Symbol(), PERIOD_H1, 1);
+         g_retrace_bar_count  = 0;
+         g_pullback_seen      = false;
+         Print("H1 Bullish BOS | Swing High: ", sh,
+               " | Retrace level (wick): ", g_h1_retrace_level);
       }
    }
    //--- Bearish BOS: H1 candle closes below a prior swing low
    else if (sl > 0 && cl1 < sl)
    {
-      if (g_state == STATE_IDLE || g_state == STATE_BULL || g_state == STATE_BULL_BOS)
+      if (g_state == STATE_IDLE || g_state == STATE_BULL        ||
+          g_state == STATE_BULL_RETRACE || g_state == STATE_BULL_BOS)
       {
-         g_state        = STATE_BEAR;
-         g_h1_swing_low = sl;
-         g_pullback_seen = false;
-         Print("H1 Bearish BOS | Swing Low: ", sl, " | H1 Close: ", cl1);
+         g_state              = STATE_BEAR_RETRACE;
+         g_h1_swing_low       = sl;
+         // Upper wick of the BOS candle is the retrace reference level
+         g_h1_retrace_level   = iHigh(Symbol(), PERIOD_H1, 1);
+         g_retrace_bar_count  = 0;
+         g_pullback_seen      = false;
+         Print("H1 Bearish BOS | Swing Low: ", sl,
+               " | Retrace level (wick): ", g_h1_retrace_level);
       }
    }
 
    //--- Invalidate an active bullish bias if a bearish structural break occurs
-   if ((g_state == STATE_BULL || g_state == STATE_BULL_BOS) && sl > 0 && cl1 < sl)
+   if ((g_state == STATE_BULL_RETRACE || g_state == STATE_BULL ||
+        g_state == STATE_BULL_BOS) && sl > 0 && cl1 < sl)
    {
       Print("H1 Bullish bias invalidated. Resetting to IDLE.");
       g_state = STATE_IDLE;
    }
 
    //--- Invalidate an active bearish bias if a bullish structural break occurs
-   if ((g_state == STATE_BEAR || g_state == STATE_BEAR_BOS) && sh > 0 && cl1 > sh)
+   if ((g_state == STATE_BEAR_RETRACE || g_state == STATE_BEAR ||
+        g_state == STATE_BEAR_BOS) && sh > 0 && cl1 > sh)
    {
       Print("H1 Bearish bias invalidated. Resetting to IDLE.");
       g_state = STATE_IDLE;
@@ -159,11 +180,79 @@ void ProcessM5()
 {
    switch (g_state)
    {
-      case STATE_BULL:     LookForBullishM5BOS(); break;
-      case STATE_BEAR:     LookForBearishM5BOS(); break;
-      case STATE_BULL_BOS: CheckBullishEntry();   break;
-      case STATE_BEAR_BOS: CheckBearishEntry();   break;
+      case STATE_BULL_RETRACE:
+      case STATE_BEAR_RETRACE: CheckH1Retrace();       break;
+      case STATE_BULL:         LookForBullishM5BOS();  break;
+      case STATE_BEAR:         LookForBearishM5BOS();  break;
+      case STATE_BULL_BOS:     CheckBullishEntry();    break;
+      case STATE_BEAR_BOS:     CheckBearishEntry();    break;
       default: break;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| H1 retrace confirmation – called on every new M5 bar            |
+//|                                                                  |
+//| A valid H1 retrace is either:                                   |
+//|  • An M5 candle whose body closes past the H1 BOS candle wick   |
+//|    (body bottom < lower wick for bull / body top > upper wick   |
+//|     for bear)                                                    |
+//|  • Two consecutive M5 candles in the opposite direction         |
+//+------------------------------------------------------------------+
+void CheckH1Retrace()
+{
+   double op1      = iOpen (Symbol(), PERIOD_M5, 1);
+   double cl1      = iClose(Symbol(), PERIOD_M5, 1);
+   double body_top = MathMax(op1, cl1);
+   double body_bot = MathMin(op1, cl1);
+
+   if (g_state == STATE_BULL_RETRACE)
+   {
+      // --- Condition 1: M5 body closes below the H1 BOS candle's lower wick ---
+      if (body_bot < g_h1_retrace_level)
+      {
+         g_state             = STATE_BULL;
+         g_retrace_bar_count = 0;
+         Print("H1 retrace confirmed (bull) | Body close below wick: ", g_h1_retrace_level);
+         return;
+      }
+
+      // --- Condition 2: two consecutive bearish M5 candles ---
+      if (cl1 < op1)
+         g_retrace_bar_count++;
+      else
+         g_retrace_bar_count = 0;
+
+      if (g_retrace_bar_count >= 2)
+      {
+         g_state             = STATE_BULL;
+         g_retrace_bar_count = 0;
+         Print("H1 retrace confirmed (bull) | 2 consecutive bearish M5 candles");
+      }
+   }
+   else if (g_state == STATE_BEAR_RETRACE)
+   {
+      // --- Condition 1: M5 body closes above the H1 BOS candle's upper wick ---
+      if (body_top > g_h1_retrace_level)
+      {
+         g_state             = STATE_BEAR;
+         g_retrace_bar_count = 0;
+         Print("H1 retrace confirmed (bear) | Body close above wick: ", g_h1_retrace_level);
+         return;
+      }
+
+      // --- Condition 2: two consecutive bullish M5 candles ---
+      if (cl1 > op1)
+         g_retrace_bar_count++;
+      else
+         g_retrace_bar_count = 0;
+
+      if (g_retrace_bar_count >= 2)
+      {
+         g_state             = STATE_BEAR;
+         g_retrace_bar_count = 0;
+         Print("H1 retrace confirmed (bear) | 2 consecutive bullish M5 candles");
+      }
    }
 }
 
