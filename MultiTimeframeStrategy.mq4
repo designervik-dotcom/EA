@@ -29,6 +29,7 @@ input int    InpM5SwingBars   = 3;         // M5 pivot: bars each side to confir
 input int    InpH1Lookback    = 40;        // H1 bars to search for structure
 input int    InpM5Lookback    = 60;        // M5 bars to search for structure
 input double InpRiskPercent   = 1.0;       // Risk per trade (% of account balance)
+input double InpRRRatio       = 3.0;       // Take profit reward:risk ratio (e.g. 3 = 1:3)
 input double InpSLBufferPips  = 3.0;       // Extra pip buffer added to stop loss
 input int    InpSlippage      = 3;         // Maximum slippage in points
 input int    InpMagicNumber   = 20240101;
@@ -329,6 +330,7 @@ void CheckBullishEntry()
    if (cl1 > body_top2)
    {
       double sl   = lo1 - InpSLBufferPips * g_pip;
+      double tp   = Ask + (Ask - sl) * InpRRRatio;
       double lots = CalculateLots(Ask - sl);
 
       if (lots <= 0)
@@ -338,13 +340,15 @@ void CheckBullishEntry()
       }
 
       int ticket = OrderSend(Symbol(), OP_BUY, lots, Ask, InpSlippage,
-                             sl, 0, InpComment, InpMagicNumber, 0, clrGreen);
+                             sl, tp, InpComment, InpMagicNumber, 0, clrGreen);
       if (ticket > 0)
       {
          g_ticket = ticket;
          g_state  = STATE_IN_TRADE;
          Print("LONG opened | Ask: ", Ask,
                " | SL: ", sl,
+               " | TP: ", tp,
+               " | RR: 1:", InpRRRatio,
                " | Lots: ", lots,
                " | Ticket: ", ticket);
       }
@@ -384,6 +388,7 @@ void CheckBearishEntry()
    if (cl1 < body_bot2)
    {
       double sl   = hi1 + InpSLBufferPips * g_pip;
+      double tp   = Bid - (sl - Bid) * InpRRRatio;
       double lots = CalculateLots(sl - Bid);
 
       if (lots <= 0)
@@ -393,13 +398,15 @@ void CheckBearishEntry()
       }
 
       int ticket = OrderSend(Symbol(), OP_SELL, lots, Bid, InpSlippage,
-                             sl, 0, InpComment, InpMagicNumber, 0, clrRed);
+                             sl, tp, InpComment, InpMagicNumber, 0, clrRed);
       if (ticket > 0)
       {
          g_ticket = ticket;
          g_state  = STATE_IN_TRADE;
          Print("SHORT opened | Bid: ", Bid,
                " | SL: ", sl,
+               " | TP: ", tp,
+               " | RR: 1:", InpRRRatio,
                " | Lots: ", lots,
                " | Ticket: ", ticket);
       }
