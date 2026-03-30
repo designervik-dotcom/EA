@@ -2,41 +2,53 @@
 //|                        M5StructureEA.mq4                         |
 //|                                                                  |
 //|  Rules:                                                          |
-//|  1. Structure  – N consecutive M5 candles in one direction       |
-//|                  defines the initial bias.                       |
-//|  2. Pullback   – 2+ consecutive opposite-direction M5 candles.  |
-//|  3. Entry      – Candle closes above (bull) / below (bear) the  |
+//|  1. H1 Bias    – N consecutive H1 candles in one direction       |
+//|                  define the higher-timeframe bias.               |
+//|                  Only M5 setups that MATCH this bias are traded. |
+//|                  When H1 bias flips, any conflicting M5 state    |
+//|                  is reset immediately.                           |
+//|  2. Structure  – N consecutive M5 candles in one direction       |
+//|                  (must match H1 bias) confirm the M5 structure.  |
+//|  3. Pullback   – 2+ consecutive opposite-direction M5 candles.  |
+//|  4. Entry      – Candle closes above (bull) / below (bear) the  |
 //|                  body of the LAST pullback candle.               |
-//|  4. Execution  – Market order on that candle's close.           |
+//|  5. Execution  – Market order on that candle's close.           |
 //|                  SL: beyond the entry candle wick (+ buffer).   |
 //|                  TP: 1:3 RR (configurable).                     |
-//|  5. Scale-ins  – After each entry the EA cycles back to          |
+//|  6. Scale-ins  – After each entry the EA cycles back to          |
 //|                  watching for the next pullback in the same      |
 //|                  direction. Bias is maintained until the         |
 //|                  structural leg is broken.                       |
-//|  6. Bias flip  – Bias changes only when a candle BODY closes     |
-//|                  below the bull leg low (for bull bias) or       |
-//|                  above the bear leg high (for bear bias).        |
-//|                  The EA then seeds the scanner with that         |
-//|                  candle and looks for the opposite setup.        |
+//|  7. M5 Bias    – M5 bias changes only when a candle BODY closes  |
+//|                  below the bull leg low / above the bear leg     |
+//|                  high. The EA then seeds the scanner with that   |
+//|                  candle and looks for the opposite setup         |
+//|                  (subject to H1 bias agreement).                 |
 //+------------------------------------------------------------------+
 #property copyright ""
 #property link      ""
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
-//--- Input parameters
-input int    InpStructureCandles = 3;        // Min consecutive M5 candles to confirm structure
-input double InpRiskPercent      = 1.0;      // Risk per trade (% of account balance)
-input double InpRRRatio          = 3.0;      // Reward : Risk ratio  (e.g. 3 = 1:3)
-input double InpSLBufferPips     = 2.0;      // Extra pip buffer added to stop loss
-input int    InpEntryTimeout     = 20;       // Max M5 bars to wait for entry signal (0 = no limit)
-input bool   InpOneTradeAtATime  = true;     // Do not open new entry while a trade is open
-input int    InpSlippage         = 3;        // Maximum slippage in points
-input int    InpMagicNumber      = 20250101;
-input string InpComment          = "M5Struct";
+//--- H1 bias filter
+input bool   InpUseH1Filter        = true;  // Enable H1 direction filter
+input int    InpH1StructureCandles = 2;     // Min consecutive H1 candles to set H1 bias
 
-//--- State machine
+//--- M5 strategy
+input int    InpStructureCandles   = 3;     // Min consecutive M5 candles to confirm structure
+input double InpRiskPercent        = 1.0;   // Risk per trade (% of account balance)
+input double InpRRRatio            = 3.0;   // Reward : Risk ratio  (e.g. 3 = 1:3)
+input double InpSLBufferPips       = 2.0;   // Extra pip buffer added to stop loss
+input int    InpEntryTimeout       = 20;    // Max M5 bars to wait for entry signal (0 = no limit)
+input bool   InpOneTradeAtATime    = true;  // Do not open new entry while a trade is open
+input int    InpSlippage           = 3;     // Maximum slippage in points
+input int    InpMagicNumber        = 20250101;
+input string InpComment            = "M5Struct";
+
+//--- H1 bias
+enum EH1Bias { H1_NONE, H1_BULL, H1_BEAR };
+
+//--- M5 state machine
 enum EState
 {
    STATE_IDLE,           // No bias – scanning for N-candle structure
@@ -47,27 +59,30 @@ enum EState
 };
 
 //--- Global variables
+EH1Bias  g_h1_bias            = H1_NONE;
+datetime g_h1_bar_time        = 0;
+int      g_h1_struct_count    = 0;
+bool     g_h1_struct_bull     = false;
+
 EState   g_state              = STATE_IDLE;
 datetime g_m5_bar_time        = 0;
 double   g_pip                = 0;
 
-// Structure scanner (used in STATE_IDLE)
-int      g_struct_count       = 0;     // consecutive same-direction candle count
-bool     g_struct_bull        = false; // direction being tracked
+// M5 structure scanner (STATE_IDLE)
+int      g_struct_count       = 0;
+bool     g_struct_bull        = false;
 
 // Pullback counter
 int      g_pullback_count     = 0;
 
 // Entry reference – body of the last pullback candle
-double   g_pullback_body_top  = 0;    // top of last pullback candle body (for bull entries)
-double   g_pullback_body_bot  = 0;    // bottom of last pullback candle body (for bear entries)
+double   g_pullback_body_top  = 0;
+double   g_pullback_body_bot  = 0;
 
 // Entry timeout counter
 int      g_entry_bars_waited  = 0;
 
-// Structural leg levels – used to detect bias invalidation
-// Bull bias: g_leg_low  = lowest low since the bullish structure began
-// Bear bias: g_leg_high = highest high since the bearish structure began
+// M5 structural leg levels for bias invalidation
 double   g_leg_low            = 0;
 double   g_leg_high           = 0;
 
@@ -77,9 +92,10 @@ double   g_leg_high           = 0;
 int OnInit()
 {
    g_pip = (Digits == 5 || Digits == 3) ? Point * 10.0 : Point;
-   Print("M5StructureEA | Symbol: ", Symbol(),
+   Print("M5StructureEA v2 | Symbol: ", Symbol(),
          " | Digits: ", Digits,
-         " | Pip: ",    g_pip);
+         " | Pip: ",    g_pip,
+         " | H1 filter: ", (InpUseH1Filter ? "ON" : "OFF"));
    return INIT_SUCCEEDED;
 }
 
@@ -92,12 +108,59 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
-//| Main tick handler – fires logic only on a new M5 bar            |
+//| Main tick handler                                                |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   if (!IsNewBar(PERIOD_M5, g_m5_bar_time)) return;
-   ProcessM5();
+   if (IsNewBar(PERIOD_H1, g_h1_bar_time)) ProcessH1();
+   if (IsNewBar(PERIOD_M5, g_m5_bar_time)) ProcessM5();
+}
+
+//+------------------------------------------------------------------+
+//| H1 bias tracker                                                  |
+//|                                                                  |
+//| Tracks consecutive H1 candles. Once InpH1StructureCandles in    |
+//| one direction are seen, H1 bias is set to BULL or BEAR.         |
+//| When bias flips, any conflicting M5 state is reset immediately. |
+//| H1_NONE (startup) does not block M5 entries.                    |
+//+------------------------------------------------------------------+
+void ProcessH1()
+{
+   if (!InpUseH1Filter) return;
+
+   double op1 = iOpen (Symbol(), PERIOD_H1, 1);
+   double cl1 = iClose(Symbol(), PERIOD_H1, 1);
+   bool   bull = (cl1 > op1);
+
+   // Track consecutive same-direction H1 candles
+   if (g_h1_struct_count == 0 || bull != g_h1_struct_bull)
+   {
+      g_h1_struct_bull  = bull;
+      g_h1_struct_count = 1;
+   }
+   else
+   {
+      g_h1_struct_count++;
+   }
+
+   if (g_h1_struct_count < InpH1StructureCandles) return;
+
+   EH1Bias new_bias = bull ? H1_BULL : H1_BEAR;
+   if (new_bias == g_h1_bias) return;   // no change
+
+   g_h1_bias = new_bias;
+   Print("H1 bias set to ", (bull ? "BULLISH" : "BEARISH"),
+         " | Consecutive H1 candles: ", g_h1_struct_count);
+
+   // Reset M5 state if it is trading against the new H1 bias
+   bool m5_long  = (g_state == STATE_BULL_PULLBACK || g_state == STATE_BULL_ENTRY);
+   bool m5_short = (g_state == STATE_BEAR_PULLBACK || g_state == STATE_BEAR_ENTRY);
+
+   if ((bull && m5_short) || (!bull && m5_long))
+   {
+      Print("M5 state conflicts with new H1 bias – M5 state reset");
+      ResetState();
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -111,72 +174,62 @@ void ProcessM5()
    double lo1  = iLow  (Symbol(), PERIOD_M5, 1);
    bool   bull = (cl1 > op1);
 
-   // Before routing, check whether the current bias has been structurally broken.
-   // This runs for all non-IDLE states.
+   // Check whether the active M5 structural leg has been broken
    if (g_state != STATE_IDLE)
       CheckBiasInvalidation(bull, op1, cl1);
 
-   // Route to the appropriate handler.
    switch (g_state)
    {
-      case STATE_IDLE:          ScanForStructure(bull, op1, cl1);               break;
-      case STATE_BULL_PULLBACK: TrackBullPullback(bull, op1, cl1);              break;
-      case STATE_BEAR_PULLBACK: TrackBearPullback(bull, op1, cl1);              break;
-      case STATE_BULL_ENTRY:    CheckBullEntry(bull, op1, cl1, lo1, hi1);       break;
-      case STATE_BEAR_ENTRY:    CheckBearEntry(bull, op1, cl1, hi1, lo1);       break;
+      case STATE_IDLE:          ScanForStructure(bull, op1, cl1);         break;
+      case STATE_BULL_PULLBACK: TrackBullPullback(bull, op1, cl1);        break;
+      case STATE_BEAR_PULLBACK: TrackBearPullback(bull, op1, cl1);        break;
+      case STATE_BULL_ENTRY:    CheckBullEntry(bull, op1, cl1, lo1, hi1); break;
+      case STATE_BEAR_ENTRY:    CheckBearEntry(bull, op1, cl1, hi1, lo1); break;
    }
 }
 
 //+------------------------------------------------------------------+
-//| Bias invalidation                                                |
+//| M5 bias invalidation – checks structural leg break               |
 //|                                                                  |
-//| Bull bias: if a candle body closes below the structural leg low  |
-//|            the bullish structure is broken.                      |
-//| Bear bias: if a candle body closes above the structural leg high |
-//|            the bearish structure is broken.                      |
-//|                                                                  |
-//| On invalidation the EA resets to STATE_IDLE and seeds the        |
-//| structure scanner with the breaking candle so the opposite       |
-//| setup can be detected quickly.                                   |
+//| Bull bias: candle body closes below the leg low  → broken        |
+//| Bear bias: candle body closes above the leg high → broken        |
 //+------------------------------------------------------------------+
 void CheckBiasInvalidation(bool bull, double op, double cl)
 {
    double body_top = MathMax(op, cl);
    double body_bot = MathMin(op, cl);
 
-   bool is_bull_bias = (g_state == STATE_BULL_PULLBACK || g_state == STATE_BULL_ENTRY);
-   bool is_bear_bias = (g_state == STATE_BEAR_PULLBACK || g_state == STATE_BEAR_ENTRY);
+   bool is_bull = (g_state == STATE_BULL_PULLBACK || g_state == STATE_BULL_ENTRY);
+   bool is_bear = (g_state == STATE_BEAR_PULLBACK || g_state == STATE_BEAR_ENTRY);
 
-   if (is_bull_bias && body_bot < g_leg_low)
+   if (is_bull && body_bot < g_leg_low)
    {
-      Print("Bullish structure BROKEN | Body bot: ", body_bot,
-            " < Leg low: ", g_leg_low, " | Switching to scan bear");
+      Print("M5 bullish structure BROKEN | Body bot: ", body_bot,
+            " < Leg low: ", g_leg_low);
       ResetState();
-      // Seed the scanner: this candle is bearish, count it as candle #1
       g_struct_bull  = false;
       g_struct_count = 1;
    }
-   else if (is_bear_bias && body_top > g_leg_high)
+   else if (is_bear && body_top > g_leg_high)
    {
-      Print("Bearish structure BROKEN | Body top: ", body_top,
-            " > Leg high: ", g_leg_high, " | Switching to scan bull");
+      Print("M5 bearish structure BROKEN | Body top: ", body_top,
+            " > Leg high: ", g_leg_high);
       ResetState();
-      // Seed the scanner: this candle is bullish, count it as candle #1
       g_struct_bull  = true;
       g_struct_count = 1;
    }
 }
 
 //+------------------------------------------------------------------+
-//| Structure scanner – runs in STATE_IDLE                           |
+//| M5 structure scanner – STATE_IDLE                                |
 //|                                                                  |
-//| Tracks consecutive same-direction candles. Once                 |
-//| InpStructureCandles are seen, the bias is confirmed and we       |
-//| move to the corresponding pullback-watch state.                  |
+//| Counts consecutive same-direction candles. On reaching           |
+//| InpStructureCandles, checks H1 bias alignment before promoting. |
+//| Bull structure → BULL_PULLBACK only if H1 is BULL or H1_NONE.   |
+//| Bear structure → BEAR_PULLBACK only if H1 is BEAR or H1_NONE.   |
 //+------------------------------------------------------------------+
 void ScanForStructure(bool bull, double op, double cl)
 {
-   // Direction change or first candle – start (or restart) the count
    if (g_struct_count == 0 || bull != g_struct_bull)
    {
       g_struct_bull  = bull;
@@ -186,43 +239,48 @@ void ScanForStructure(bool bull, double op, double cl)
 
    g_struct_count++;
 
-   if (g_struct_count >= InpStructureCandles)
+   if (g_struct_count < InpStructureCandles) return;
+
+   if (bull)
    {
-      // Capture the structural leg level from the last InpStructureCandles bars
-      if (bull)
+      // Only promote if H1 agrees (or H1 bias not yet established)
+      if (InpUseH1Filter && g_h1_bias == H1_BEAR)
       {
-         g_leg_low = LegLow(InpStructureCandles);
-         g_state   = STATE_BULL_PULLBACK;
-         g_pullback_count = 0;
-         Print("Bullish structure confirmed | Candles: ", g_struct_count,
-               " | Leg low: ", g_leg_low);
+         Print("M5 bullish structure detected but H1 is BEARISH – setup skipped");
+         return;
       }
-      else
+      g_leg_low        = LegLow(InpStructureCandles);
+      g_state          = STATE_BULL_PULLBACK;
+      g_pullback_count = 0;
+      Print("M5 bullish structure confirmed | Candles: ", g_struct_count,
+            " | Leg low: ", g_leg_low,
+            " | H1 bias: ", H1BiasLabel());
+   }
+   else
+   {
+      if (InpUseH1Filter && g_h1_bias == H1_BULL)
       {
-         g_leg_high = LegHigh(InpStructureCandles);
-         g_state    = STATE_BEAR_PULLBACK;
-         g_pullback_count = 0;
-         Print("Bearish structure confirmed | Candles: ", g_struct_count,
-               " | Leg high: ", g_leg_high);
+         Print("M5 bearish structure detected but H1 is BULLISH – setup skipped");
+         return;
       }
+      g_leg_high       = LegHigh(InpStructureCandles);
+      g_state          = STATE_BEAR_PULLBACK;
+      g_pullback_count = 0;
+      Print("M5 bearish structure confirmed | Candles: ", g_struct_count,
+            " | Leg high: ", g_leg_high,
+            " | H1 bias: ", H1BiasLabel());
    }
 }
 
 //+------------------------------------------------------------------+
 //| Bullish pullback tracker – STATE_BULL_PULLBACK                  |
-//|                                                                  |
-//| Counts consecutive bearish candles (the retracement).           |
-//| Once 2+ are seen the last candle's body top is saved and we     |
-//| move to STATE_BULL_ENTRY.                                        |
-//| A bullish candle resets the pullback counter (but the bias and  |
-//| structural leg level remain valid – we just wait again).        |
 //+------------------------------------------------------------------+
 void TrackBullPullback(bool bull, double op, double cl)
 {
-   if (!bull)   // bearish = retracement direction
+   if (!bull)
    {
       g_pullback_count++;
-      g_pullback_body_top = MathMax(op, cl);   // body top of this pullback candle
+      g_pullback_body_top = MathMax(op, cl);
 
       if (g_pullback_count >= 2)
       {
@@ -242,17 +300,13 @@ void TrackBullPullback(bool bull, double op, double cl)
 
 //+------------------------------------------------------------------+
 //| Bearish pullback tracker – STATE_BEAR_PULLBACK                  |
-//|                                                                  |
-//| Counts consecutive bullish candles (the retracement).           |
-//| Once 2+ are seen the last candle's body bottom is saved and we  |
-//| move to STATE_BEAR_ENTRY.                                        |
 //+------------------------------------------------------------------+
 void TrackBearPullback(bool bull, double op, double cl)
 {
-   if (bull)   // bullish = retracement direction
+   if (bull)
    {
       g_pullback_count++;
-      g_pullback_body_bot = MathMin(op, cl);   // body bottom of this pullback candle
+      g_pullback_body_bot = MathMin(op, cl);
 
       if (g_pullback_count >= 2)
       {
@@ -273,23 +327,18 @@ void TrackBearPullback(bool bull, double op, double cl)
 //+------------------------------------------------------------------+
 //| Bullish entry check – STATE_BULL_ENTRY                          |
 //|                                                                  |
-//| Waits for a candle to close above the last pullback candle's    |
-//| body top. That close IS the entry trigger.                       |
-//|   • More bearish candles extend/update the reference body.      |
-//|   • Timeout resets to BULL_PULLBACK to wait for a fresh setup.  |
-//|   • SL  = entry candle low – buffer                             |
-//|   • TP  = Ask + (Ask − SL) × RR                                 |
-//| After a successful trade the EA cycles back to BULL_PULLBACK    |
-//| to look for scale-in opportunities.                              |
+//| Entry trigger: bullish candle closes above g_pullback_body_top. |
+//| SL = entry candle low – buffer.                                  |
+//| TP = Ask + (Ask − SL) × RR.                                     |
+//| After entry: cycles back to BULL_PULLBACK for scale-ins.        |
 //+------------------------------------------------------------------+
 void CheckBullEntry(bool bull, double op, double cl, double lo, double hi)
 {
    g_entry_bars_waited++;
 
-   // Optional timeout – prevent getting stuck if setup never fires
    if (InpEntryTimeout > 0 && g_entry_bars_waited > InpEntryTimeout)
    {
-      Print("Bull entry timed out after ", g_entry_bars_waited, " bars – resetting to pullback watch");
+      Print("Bull entry timed out after ", g_entry_bars_waited, " bars – back to pullback watch");
       g_state             = STATE_BULL_PULLBACK;
       g_pullback_count    = 0;
       g_entry_bars_waited = 0;
@@ -298,19 +347,24 @@ void CheckBullEntry(bool bull, double op, double cl, double lo, double hi)
 
    if (!bull)
    {
-      // Pullback is extending – update the reference to this candle's body
       g_pullback_body_top = MathMax(op, cl);
       Print("Bull entry: pullback extended | New body top ref: ", g_pullback_body_top);
       return;
    }
 
-   // Entry trigger: bullish candle closes above the last pullback candle's body top
-   if (cl <= g_pullback_body_top) return;   // not yet
+   if (cl <= g_pullback_body_top) return;   // trigger not yet reached
+
+   // Final H1 alignment check (safety net – should already be aligned)
+   if (InpUseH1Filter && g_h1_bias == H1_BEAR)
+   {
+      Print("Bull entry blocked – H1 turned BEARISH");
+      ResetState();
+      return;
+   }
 
    if (InpOneTradeAtATime && IsTradeOpen())
    {
       Print("Bull entry signal – skipped (trade already open)");
-      // Cycle back to look for the next pullback opportunity
       g_state          = STATE_BULL_PULLBACK;
       g_pullback_count = 0;
       return;
@@ -344,13 +398,12 @@ void CheckBullEntry(bool bull, double op, double cl, double lo, double hi)
                           InpComment, InpMagicNumber, 0, clrGreen);
    if (ticket > 0)
    {
-      Print("LONG opened | Ask: ",  Ask,
-            " | SL: ",  sl,
-            " | TP: ",  tp,
+      Print("LONG opened | Ask: ", Ask,
+            " | SL: ", sl, " | TP: ", tp,
             " | RR: 1:", InpRRRatio,
             " | Lots: ", lots,
+            " | H1: ", H1BiasLabel(),
             " | Ticket: ", ticket);
-      // Cycle back to BULL_PULLBACK – watch for next scale-in
       g_state             = STATE_BULL_PULLBACK;
       g_pullback_count    = 0;
       g_entry_bars_waited = 0;
@@ -364,11 +417,9 @@ void CheckBullEntry(bool bull, double op, double cl, double lo, double hi)
 //+------------------------------------------------------------------+
 //| Bearish entry check – STATE_BEAR_ENTRY                          |
 //|                                                                  |
-//| Mirror of CheckBullEntry for the short side.                    |
-//| Entry trigger: candle closes below the last pullback candle's   |
-//| body bottom.                                                     |
-//|   • SL  = entry candle high + buffer                            |
-//|   • TP  = Bid − (SL − Bid) × RR                                 |
+//| Entry trigger: bearish candle closes below g_pullback_body_bot. |
+//| SL = entry candle high + buffer.                                 |
+//| TP = Bid − (SL − Bid) × RR.                                     |
 //+------------------------------------------------------------------+
 void CheckBearEntry(bool bull, double op, double cl, double hi, double lo)
 {
@@ -376,7 +427,7 @@ void CheckBearEntry(bool bull, double op, double cl, double hi, double lo)
 
    if (InpEntryTimeout > 0 && g_entry_bars_waited > InpEntryTimeout)
    {
-      Print("Bear entry timed out after ", g_entry_bars_waited, " bars – resetting to pullback watch");
+      Print("Bear entry timed out after ", g_entry_bars_waited, " bars – back to pullback watch");
       g_state             = STATE_BEAR_PULLBACK;
       g_pullback_count    = 0;
       g_entry_bars_waited = 0;
@@ -385,14 +436,19 @@ void CheckBearEntry(bool bull, double op, double cl, double hi, double lo)
 
    if (bull)
    {
-      // Pullback is extending – update the reference to this candle's body
       g_pullback_body_bot = MathMin(op, cl);
       Print("Bear entry: pullback extended | New body bot ref: ", g_pullback_body_bot);
       return;
    }
 
-   // Entry trigger: bearish candle closes below the last pullback candle's body bottom
-   if (cl >= g_pullback_body_bot) return;   // not yet
+   if (cl >= g_pullback_body_bot) return;
+
+   if (InpUseH1Filter && g_h1_bias == H1_BULL)
+   {
+      Print("Bear entry blocked – H1 turned BULLISH");
+      ResetState();
+      return;
+   }
 
    if (InpOneTradeAtATime && IsTradeOpen())
    {
@@ -431,12 +487,11 @@ void CheckBearEntry(bool bull, double op, double cl, double hi, double lo)
    if (ticket > 0)
    {
       Print("SHORT opened | Bid: ", Bid,
-            " | SL: ",  sl,
-            " | TP: ",  tp,
+            " | SL: ", sl, " | TP: ", tp,
             " | RR: 1:", InpRRRatio,
             " | Lots: ", lots,
+            " | H1: ", H1BiasLabel(),
             " | Ticket: ", ticket);
-      // Cycle back to BEAR_PULLBACK – watch for next scale-in
       g_state             = STATE_BEAR_PULLBACK;
       g_pullback_count    = 0;
       g_entry_bars_waited = 0;
@@ -451,7 +506,6 @@ void CheckBearEntry(bool bull, double op, double cl, double hi, double lo)
 //| Helpers                                                          |
 //+------------------------------------------------------------------+
 
-// Reset to a clean idle state
 void ResetState()
 {
    g_state             = STATE_IDLE;
@@ -464,32 +518,23 @@ void ResetState()
    g_leg_high          = 0;
 }
 
-// Returns true on the first tick of a new bar for timeframe tf
 bool IsNewBar(int tf, datetime &last_time)
 {
    datetime cur = iTime(Symbol(), tf, 0);
-   if (cur != last_time)
-   {
-      last_time = cur;
-      return true;
-   }
+   if (cur != last_time) { last_time = cur; return true; }
    return false;
 }
 
-// Returns true if this EA has an open order on this symbol
 bool IsTradeOpen()
 {
    for (int i = 0; i < OrdersTotal(); i++)
-   {
       if (OrderSelect(i, SELECT_BY_POS, MODE_TRADES) &&
           OrderMagicNumber() == InpMagicNumber        &&
           OrderSymbol()      == Symbol())
          return true;
-   }
    return false;
 }
 
-// Lowest low of the last n closed bars (bar 1 … bar n)
 double LegLow(int n)
 {
    double v = iLow(Symbol(), PERIOD_M5, 1);
@@ -498,7 +543,6 @@ double LegLow(int n)
    return v;
 }
 
-// Highest high of the last n closed bars (bar 1 … bar n)
 double LegHigh(int n)
 {
    double v = iHigh(Symbol(), PERIOD_M5, 1);
@@ -507,7 +551,13 @@ double LegHigh(int n)
    return v;
 }
 
-// Position size from a fixed risk percentage
+string H1BiasLabel()
+{
+   if (g_h1_bias == H1_BULL) return "BULL";
+   if (g_h1_bias == H1_BEAR) return "BEAR";
+   return "NONE";
+}
+
 double CalculateLots(double sl_distance)
 {
    if (sl_distance <= 0) return 0;
