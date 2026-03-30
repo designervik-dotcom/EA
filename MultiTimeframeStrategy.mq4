@@ -9,8 +9,9 @@
 //|                                                                  |
 //|  2. M5 Entry:                                                    |
 //|     a. Wait for H1 retrace – confirmed by EITHER:               |
-//|        • An M5 candle body closing past the H1 BOS candle wick  |
-//|        • Two consecutive M5 candles in the opposite direction    |
+//|        • An H1 candle body closes past the H1 BOS candle's wick  |
+//|          in the opposite direction                               |
+//|        • Two consecutive H1 candles in the opposite direction    |
 //|     b. Detect the first 5-min Break of Structure (BOS) in the   |
 //|        same direction as the H1 bias.                            |
 //|     c. After the M5 BOS, wait for price to pull back.           |
@@ -59,10 +60,10 @@ double   g_h1_swing_high     = 0;
 double   g_h1_swing_low      = 0;
 
 // H1 retrace tracking
-// Bullish: lower wick of the H1 BOS candle – body must close below this
-// Bearish: upper wick of the H1 BOS candle – body must close above this
+// Bullish: lower wick of the H1 BOS candle – an H1 body must close below this
+// Bearish: upper wick of the H1 BOS candle – an H1 body must close above this
 double   g_h1_retrace_level  = 0;
-int      g_retrace_bar_count = 0;  // consecutive opposite-direction M5 bars
+int      g_retrace_bar_count = 0;  // consecutive opposite-direction H1 bars
 
 // M5 BOS details
 double   g_bos_close     = 0;  // Close of the M5 candle that created the BOS
@@ -111,8 +112,12 @@ void OnTick()
    }
 
    // Process each timeframe only on the open of a new bar
-   if (IsNewBar(PERIOD_H1, g_h1_bar_time)) CheckH1Bias();
-   if (IsNewBar(PERIOD_M5,  g_m5_bar_time)) ProcessM5();
+   if (IsNewBar(PERIOD_H1, g_h1_bar_time))
+   {
+      CheckH1Bias();
+      CheckH1Retrace();
+   }
+   if (IsNewBar(PERIOD_M5, g_m5_bar_time)) ProcessM5();
 }
 
 //+------------------------------------------------------------------+
@@ -181,44 +186,43 @@ void ProcessM5()
 {
    switch (g_state)
    {
-      case STATE_BULL_RETRACE:
-      case STATE_BEAR_RETRACE: CheckH1Retrace();       break;
-      case STATE_BULL:         LookForBullishM5BOS();  break;
-      case STATE_BEAR:         LookForBearishM5BOS();  break;
-      case STATE_BULL_BOS:     CheckBullishEntry();    break;
-      case STATE_BEAR_BOS:     CheckBearishEntry();    break;
+      case STATE_BULL:     LookForBullishM5BOS();  break;
+      case STATE_BEAR:     LookForBearishM5BOS();  break;
+      case STATE_BULL_BOS: CheckBullishEntry();    break;
+      case STATE_BEAR_BOS: CheckBearishEntry();    break;
       default: break;
    }
 }
 
 //+------------------------------------------------------------------+
-//| H1 retrace confirmation – called on every new M5 bar            |
+//| H1 retrace confirmation – called on every new H1 bar            |
 //|                                                                  |
-//| A valid H1 retrace is either:                                   |
-//|  • An M5 candle whose body closes past the H1 BOS candle wick   |
-//|    (body bottom < lower wick for bull / body top > upper wick   |
-//|     for bear)                                                    |
-//|  • Two consecutive M5 candles in the opposite direction         |
+//| A valid H1 retrace is confirmed by EITHER:                      |
+//|  1. An H1 candle body closes past the BOS candle's wick in the  |
+//|     opposite direction (body bottom < lower wick for bull /     |
+//|     body top > upper wick for bear)                             |
+//|  2. Two consecutive H1 candles in the opposite direction        |
 //+------------------------------------------------------------------+
 void CheckH1Retrace()
 {
-   double op1      = iOpen (Symbol(), PERIOD_M5, 1);
-   double cl1      = iClose(Symbol(), PERIOD_M5, 1);
+   if (g_state != STATE_BULL_RETRACE && g_state != STATE_BEAR_RETRACE) return;
+
+   double op1      = iOpen (Symbol(), PERIOD_H1, 1);
+   double cl1      = iClose(Symbol(), PERIOD_H1, 1);
    double body_top = MathMax(op1, cl1);
    double body_bot = MathMin(op1, cl1);
 
    if (g_state == STATE_BULL_RETRACE)
    {
-      // --- Condition 1: M5 body closes below the H1 BOS candle's lower wick ---
+      // Condition 1: bearish H1 body closes below the BOS candle's lower wick
       if (body_bot < g_h1_retrace_level)
       {
          g_state             = STATE_BULL;
          g_retrace_bar_count = 0;
-         Print("H1 retrace confirmed (bull) | Body close below wick: ", g_h1_retrace_level);
+         Print("H1 retrace confirmed (bull) | H1 body closed below wick: ", g_h1_retrace_level);
          return;
       }
-
-      // --- Condition 2: two consecutive bearish M5 candles ---
+      // Condition 2: two consecutive bearish H1 candles
       if (cl1 < op1)
          g_retrace_bar_count++;
       else
@@ -228,21 +232,20 @@ void CheckH1Retrace()
       {
          g_state             = STATE_BULL;
          g_retrace_bar_count = 0;
-         Print("H1 retrace confirmed (bull) | 2 consecutive bearish M5 candles");
+         Print("H1 retrace confirmed (bull) | 2 consecutive bearish H1 candles");
       }
    }
    else if (g_state == STATE_BEAR_RETRACE)
    {
-      // --- Condition 1: M5 body closes above the H1 BOS candle's upper wick ---
+      // Condition 1: bullish H1 body closes above the BOS candle's upper wick
       if (body_top > g_h1_retrace_level)
       {
          g_state             = STATE_BEAR;
          g_retrace_bar_count = 0;
-         Print("H1 retrace confirmed (bear) | Body close above wick: ", g_h1_retrace_level);
+         Print("H1 retrace confirmed (bear) | H1 body closed above wick: ", g_h1_retrace_level);
          return;
       }
-
-      // --- Condition 2: two consecutive bullish M5 candles ---
+      // Condition 2: two consecutive bullish H1 candles
       if (cl1 > op1)
          g_retrace_bar_count++;
       else
@@ -252,7 +255,7 @@ void CheckH1Retrace()
       {
          g_state             = STATE_BEAR;
          g_retrace_bar_count = 0;
-         Print("H1 retrace confirmed (bear) | 2 consecutive bullish M5 candles");
+         Print("H1 retrace confirmed (bear) | 2 consecutive bullish H1 candles");
       }
    }
 }
