@@ -15,9 +15,15 @@
 //|     b. Detect the first 5-min Break of Structure (BOS) in the   |
 //|        same direction as the H1 bias.                            |
 //|     c. After the M5 BOS, wait for price to pull back.           |
-//|     d. Entry: next M5 candle that closes above (bull) / below   |
-//|        (bear) the previous candle's high / low.                  |
+//|     d. Initial entry: M5 candle body closes above (bull) /      |
+//|        below (bear) the previous candle's body.                 |
 //|     e. Stop loss: below (bull) / above (bear) the entry candle. |
+//|                                                                  |
+//|  3. Scale-ins (within the same H1 leg):                         |
+//|     After each M5 leg, wait for a pullback then enter again     |
+//|     when a 5M candle body closes fully above (bull) / below     |
+//|     (bear) the previous candle's body (full body engulf).       |
+//|     Each scale-in uses the same SL and 1:3 TP rules.            |
 //+------------------------------------------------------------------+
 #property copyright ""
 #property link      ""
@@ -44,9 +50,10 @@ enum EState
    STATE_BEAR_RETRACE,   // H1 bearish bias set, awaiting H1 retrace confirmation
    STATE_BULL,           // H1 retrace confirmed, scanning M5 for bullish BOS
    STATE_BEAR,           // H1 retrace confirmed, scanning M5 for bearish BOS
-   STATE_BULL_BOS,       // M5 bullish BOS confirmed, awaiting pullback then entry
-   STATE_BEAR_BOS,       // M5 bearish BOS confirmed, awaiting pullback then entry
-   STATE_IN_TRADE        // Position is open
+   STATE_BULL_BOS,       // M5 bullish BOS confirmed, awaiting pullback then initial entry
+   STATE_BEAR_BOS,       // M5 bearish BOS confirmed, awaiting pullback then initial entry
+   STATE_BULL_SCALE,     // Initial entry taken, watching for further M5 scale-in setups
+   STATE_BEAR_SCALE      // Initial entry taken, watching for further M5 scale-in setups
 };
 
 //--- Global variables
@@ -66,12 +73,15 @@ double   g_h1_retrace_level  = 0;
 int      g_retrace_bar_count = 0;  // consecutive opposite-direction H1 bars
 
 // M5 BOS details
-double   g_bos_close     = 0;  // Close of the M5 candle that created the BOS
-double   g_bos_bar_high  = 0;
-double   g_bos_bar_low   = 0;
-bool     g_pullback_seen = false;
+double   g_bos_close          = 0;   // Close of the M5 candle that created the BOS
+double   g_bos_bar_high       = 0;
+double   g_bos_bar_low        = 0;
+bool     g_pullback_seen      = false;
 
-int      g_ticket        = -1;
+// Scale-in tracking
+// Reset to false each time an entry (initial or scale) is placed.
+// Set to true when a pullback candle is detected after that entry.
+bool     g_scale_pullback_seen = false;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
@@ -99,19 +109,8 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // While in a trade just monitor for closure
-   if (g_state == STATE_IN_TRADE)
-   {
-      if (!IsTradeOpen())
-      {
-         Print("Trade closed. Returning to IDLE.");
-         g_state = STATE_IDLE;
-         g_ticket = -1;
-      }
-      return;
-   }
-
-   // Process each timeframe only on the open of a new bar
+   // Process each timeframe only on the open of a new bar.
+   // No trade-open gate – scale-ins must keep firing while H1 bias holds.
    if (IsNewBar(PERIOD_H1, g_h1_bar_time))
    {
       CheckH1Bias();
@@ -163,16 +162,18 @@ void CheckH1Bias()
    }
 
    //--- Invalidate an active bullish bias if a bearish structural break occurs
-   if ((g_state == STATE_BULL_RETRACE || g_state == STATE_BULL ||
-        g_state == STATE_BULL_BOS) && sl > 0 && cl1 < sl)
+   if ((g_state == STATE_BULL_RETRACE || g_state == STATE_BULL  ||
+        g_state == STATE_BULL_BOS     || g_state == STATE_BULL_SCALE) &&
+       sl > 0 && cl1 < sl)
    {
       Print("H1 Bullish bias invalidated. Resetting to IDLE.");
       g_state = STATE_IDLE;
    }
 
    //--- Invalidate an active bearish bias if a bullish structural break occurs
-   if ((g_state == STATE_BEAR_RETRACE || g_state == STATE_BEAR ||
-        g_state == STATE_BEAR_BOS) && sh > 0 && cl1 > sh)
+   if ((g_state == STATE_BEAR_RETRACE || g_state == STATE_BEAR  ||
+        g_state == STATE_BEAR_BOS     || g_state == STATE_BEAR_SCALE) &&
+       sh > 0 && cl1 > sh)
    {
       Print("H1 Bearish bias invalidated. Resetting to IDLE.");
       g_state = STATE_IDLE;
@@ -186,10 +187,12 @@ void ProcessM5()
 {
    switch (g_state)
    {
-      case STATE_BULL:     LookForBullishM5BOS();  break;
-      case STATE_BEAR:     LookForBearishM5BOS();  break;
-      case STATE_BULL_BOS: CheckBullishEntry();    break;
-      case STATE_BEAR_BOS: CheckBearishEntry();    break;
+      case STATE_BULL:       LookForBullishM5BOS();   break;
+      case STATE_BEAR:       LookForBearishM5BOS();   break;
+      case STATE_BULL_BOS:   CheckBullishEntry();     break;
+      case STATE_BEAR_BOS:   CheckBearishEntry();     break;
+      case STATE_BULL_SCALE: CheckBullishScaleIn();   break;
+      case STATE_BEAR_SCALE: CheckBearishScaleIn();   break;
       default: break;
    }
 }
@@ -346,8 +349,8 @@ void CheckBullishEntry()
                              sl, tp, InpComment, InpMagicNumber, 0, clrGreen);
       if (ticket > 0)
       {
-         g_ticket = ticket;
-         g_state  = STATE_IN_TRADE;
+         g_state              = STATE_BULL_SCALE;
+         g_scale_pullback_seen = false;
          Print("LONG opened | Ask: ", Ask,
                " | SL: ", sl,
                " | TP: ", tp,
@@ -404,8 +407,8 @@ void CheckBearishEntry()
                              sl, tp, InpComment, InpMagicNumber, 0, clrRed);
       if (ticket > 0)
       {
-         g_ticket = ticket;
-         g_state  = STATE_IN_TRADE;
+         g_state               = STATE_BEAR_SCALE;
+         g_scale_pullback_seen = false;
          Print("SHORT opened | Bid: ", Bid,
                " | SL: ", sl,
                " | TP: ", tp,
@@ -503,6 +506,116 @@ double CalculateLots(double sl_distance)
 
    lots = MathFloor(lots / lot_step) * lot_step;
    return MathMax(min_lot, MathMin(max_lot, lots));
+}
+
+//+------------------------------------------------------------------+
+//| Scale-in: bullish – watch for M5 pullback then full body engulf  |
+//|                                                                  |
+//| Pullback: any bearish M5 candle (close < open)                  |
+//| Entry:    current candle body entirely above previous candle     |
+//|           body (body_bot1 > body_top2) — full body engulf        |
+//| SL:       below the entry candle low                            |
+//+------------------------------------------------------------------+
+void CheckBullishScaleIn()
+{
+   double op1 = iOpen (Symbol(), PERIOD_M5, 1);
+   double cl1 = iClose(Symbol(), PERIOD_M5, 1);
+   double op2 = iOpen (Symbol(), PERIOD_M5, 2);
+   double cl2 = iClose(Symbol(), PERIOD_M5, 2);
+   double lo1 = iLow  (Symbol(), PERIOD_M5, 1);
+
+   // Step 1 – detect pullback: any bearish M5 candle after the last entry
+   if (!g_scale_pullback_seen)
+   {
+      if (cl1 < op1)
+      {
+         g_scale_pullback_seen = true;
+         Print("Scale-in pullback detected (bull) | M5 close: ", cl1);
+      }
+      return;
+   }
+
+   // Step 2 – full body engulf: entire body of current candle above previous body
+   double body_bot1 = MathMin(op1, cl1);
+   double body_top2 = MathMax(op2, cl2);
+
+   if (body_bot1 > body_top2)
+   {
+      double sl   = lo1 - InpSLBufferPips * g_pip;
+      double tp   = Ask + (Ask - sl) * InpRRRatio;
+      double lots = CalculateLots(Ask - sl);
+
+      if (lots <= 0) { Print("Scale-in lot size error – skipped."); return; }
+
+      int ticket = OrderSend(Symbol(), OP_BUY, lots, Ask, InpSlippage,
+                             sl, tp, InpComment + "_SI", InpMagicNumber, 0, clrBlue);
+      if (ticket > 0)
+      {
+         g_scale_pullback_seen = false;
+         Print("SCALE-IN LONG | Ask: ", Ask,
+               " | SL: ", sl, " | TP: ", tp,
+               " | Lots: ", lots, " | Ticket: ", ticket);
+      }
+      else
+      {
+         Print("Scale-in BUY failed | Error: ", GetLastError());
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Scale-in: bearish – watch for M5 pullback then full body engulf  |
+//|                                                                  |
+//| Pullback: any bullish M5 candle (close > open)                  |
+//| Entry:    current candle body entirely below previous candle     |
+//|           body (body_top1 < body_bot2) — full body engulf        |
+//| SL:       above the entry candle high                           |
+//+------------------------------------------------------------------+
+void CheckBearishScaleIn()
+{
+   double op1 = iOpen (Symbol(), PERIOD_M5, 1);
+   double cl1 = iClose(Symbol(), PERIOD_M5, 1);
+   double op2 = iOpen (Symbol(), PERIOD_M5, 2);
+   double cl2 = iClose(Symbol(), PERIOD_M5, 2);
+   double hi1 = iHigh (Symbol(), PERIOD_M5, 1);
+
+   // Step 1 – detect pullback: any bullish M5 candle after the last entry
+   if (!g_scale_pullback_seen)
+   {
+      if (cl1 > op1)
+      {
+         g_scale_pullback_seen = true;
+         Print("Scale-in pullback detected (bear) | M5 close: ", cl1);
+      }
+      return;
+   }
+
+   // Step 2 – full body engulf: entire body of current candle below previous body
+   double body_top1 = MathMax(op1, cl1);
+   double body_bot2 = MathMin(op2, cl2);
+
+   if (body_top1 < body_bot2)
+   {
+      double sl   = hi1 + InpSLBufferPips * g_pip;
+      double tp   = Bid - (sl - Bid) * InpRRRatio;
+      double lots = CalculateLots(sl - Bid);
+
+      if (lots <= 0) { Print("Scale-in lot size error – skipped."); return; }
+
+      int ticket = OrderSend(Symbol(), OP_SELL, lots, Bid, InpSlippage,
+                             sl, tp, InpComment + "_SI", InpMagicNumber, 0, clrOrange);
+      if (ticket > 0)
+      {
+         g_scale_pullback_seen = false;
+         Print("SCALE-IN SHORT | Bid: ", Bid,
+               " | SL: ", sl, " | TP: ", tp,
+               " | Lots: ", lots, " | Ticket: ", ticket);
+      }
+      else
+      {
+         Print("Scale-in SELL failed | Error: ", GetLastError());
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
