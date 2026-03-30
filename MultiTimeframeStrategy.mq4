@@ -8,21 +8,22 @@
 //|     • Bearish bias  – H1 candle closes BELOW a prior swing low   |
 //|                                                                  |
 //|  2. M5 Entry:                                                    |
-//|     a. Wait for H1 retrace – confirmed by EITHER:               |
-//|        • An H1 candle body closes past the H1 BOS candle's wick  |
-//|          in the opposite direction                               |
-//|        • Two consecutive H1 candles in the opposite direction    |
-//|     b. Detect the first 5-min Break of Structure (BOS) in the   |
-//|        same direction as the H1 bias.                            |
-//|     c. After the M5 BOS, wait for price to pull back.           |
-//|     d. Initial entry: M5 candle body closes above (bull) /      |
-//|        below (bear) the previous candle's body.                 |
-//|     e. Stop loss: below (bull) / above (bear) the entry candle. |
+//|     a. H1 leg: after the BOS, the leg continues while H1 candles |
+//|        form in the bias direction. The wick reference updates     |
+//|        to the last candle in the leg on each new bar.            |
+//|        Retrace starts ONLY when an opposite H1 candle body       |
+//|        closes past that last leg candle's wick.                  |
+//|     b. Once the H1 retrace begins, watch the 5-min for structure |
+//|        that matches the H1 bias – first M5 BOS in that direction. |
+//|     c. After the M5 BOS, wait for a 5M pullback.                |
+//|     d. Initial entry: M5 candle body closes above (bull) /       |
+//|        below (bear) the previous candle's body.                  |
+//|     e. Stop loss: below (bull) / above (bear) the entry candle.  |
 //|                                                                  |
 //|  3. Scale-ins (within the same H1 leg):                         |
-//|     After each M5 leg, wait for a pullback then enter again     |
-//|     when a 5M candle body closes fully above (bull) / below     |
-//|     (bear) the previous candle's body (full body engulf).       |
+//|     After each M5 leg, wait for a pullback then enter again      |
+//|     when a 5M candle body closes fully above (bull) / below      |
+//|     (bear) the previous candle's body (full body engulf).        |
 //|     Each scale-in uses the same SL and 1:3 TP rules.            |
 //+------------------------------------------------------------------+
 #property copyright ""
@@ -66,11 +67,13 @@ double   g_pip           = 0;
 double   g_h1_swing_high     = 0;
 double   g_h1_swing_low      = 0;
 
-// H1 retrace tracking
-// Bullish: lower wick of the H1 BOS candle – an H1 body must close below this
-// Bearish: upper wick of the H1 BOS candle – an H1 body must close above this
-double   g_h1_retrace_level  = 0;
-int      g_retrace_bar_count = 0;  // consecutive opposite-direction H1 bars
+// H1 leg tracking
+// Tracks the wick of the LAST H1 candle in the bias direction.
+// Updated on every new H1 candle that continues the leg.
+// Retrace is confirmed only when an opposite candle body closes past this level.
+// Bullish leg: last bullish H1 candle's lower wick (iLow)
+// Bearish leg: last bearish H1 candle's upper wick (iHigh)
+double   g_h1_leg_last_wick  = 0;
 
 // M5 BOS details
 double   g_bos_close          = 0;   // Close of the M5 candle that created the BOS
@@ -134,14 +137,13 @@ void CheckH1Bias()
       if (g_state == STATE_IDLE || g_state == STATE_BEAR        ||
           g_state == STATE_BEAR_RETRACE || g_state == STATE_BEAR_BOS)
       {
-         g_state              = STATE_BULL_RETRACE;
-         g_h1_swing_high      = sh;
-         // Lower wick of the BOS candle is the retrace reference level
-         g_h1_retrace_level   = iLow(Symbol(), PERIOD_H1, 1);
-         g_retrace_bar_count  = 0;
-         g_pullback_seen      = false;
+         g_state             = STATE_BULL_RETRACE;
+         g_h1_swing_high     = sh;
+         // Seed with BOS candle's lower wick – will update as leg continues
+         g_h1_leg_last_wick  = iLow(Symbol(), PERIOD_H1, 1);
+         g_pullback_seen     = false;
          Print("H1 Bullish BOS | Swing High: ", sh,
-               " | Retrace level (wick): ", g_h1_retrace_level);
+               " | Leg wick seed: ", g_h1_leg_last_wick);
       }
    }
    //--- Bearish BOS: H1 candle closes below a prior swing low
@@ -150,14 +152,13 @@ void CheckH1Bias()
       if (g_state == STATE_IDLE || g_state == STATE_BULL        ||
           g_state == STATE_BULL_RETRACE || g_state == STATE_BULL_BOS)
       {
-         g_state              = STATE_BEAR_RETRACE;
-         g_h1_swing_low       = sl;
-         // Upper wick of the BOS candle is the retrace reference level
-         g_h1_retrace_level   = iHigh(Symbol(), PERIOD_H1, 1);
-         g_retrace_bar_count  = 0;
-         g_pullback_seen      = false;
+         g_state             = STATE_BEAR_RETRACE;
+         g_h1_swing_low      = sl;
+         // Seed with BOS candle's upper wick – will update as leg continues
+         g_h1_leg_last_wick  = iHigh(Symbol(), PERIOD_H1, 1);
+         g_pullback_seen     = false;
          Print("H1 Bearish BOS | Swing Low: ", sl,
-               " | Retrace level (wick): ", g_h1_retrace_level);
+               " | Leg wick seed: ", g_h1_leg_last_wick);
       }
    }
 
@@ -198,13 +199,15 @@ void ProcessM5()
 }
 
 //+------------------------------------------------------------------+
-//| H1 retrace confirmation – called on every new H1 bar            |
+//| H1 leg tracker and retrace detector – called on every new H1 bar|
 //|                                                                  |
-//| A valid H1 retrace is confirmed by EITHER:                      |
-//|  1. An H1 candle body closes past the BOS candle's wick in the  |
-//|     opposite direction (body bottom < lower wick for bull /     |
-//|     body top > upper wick for bear)                             |
-//|  2. Two consecutive H1 candles in the opposite direction        |
+//| While the leg is forming (STATE_BULL/BEAR_RETRACE):             |
+//|   • Each H1 candle in the bias direction extends the leg –      |
+//|     update g_h1_leg_last_wick to that candle's wick             |
+//|   • The leg ends ONLY when an opposing candle body closes past  |
+//|     the wick of the LAST candle in the leg:                     |
+//|     Bull: bearish H1 body bottom < last bullish candle's low    |
+//|     Bear: bullish H1 body top   > last bearish candle's high    |
 //+------------------------------------------------------------------+
 void CheckH1Retrace()
 {
@@ -217,48 +220,38 @@ void CheckH1Retrace()
 
    if (g_state == STATE_BULL_RETRACE)
    {
-      // Condition 1: bearish H1 body closes below the BOS candle's lower wick
-      if (body_bot < g_h1_retrace_level)
+      if (cl1 > op1)
       {
-         g_state             = STATE_BULL;
-         g_retrace_bar_count = 0;
-         Print("H1 retrace confirmed (bull) | H1 body closed below wick: ", g_h1_retrace_level);
-         return;
+         // Bullish candle – leg is still going, update the wick reference
+         g_h1_leg_last_wick = iLow(Symbol(), PERIOD_H1, 1);
+         Print("H1 leg extended (bull) | New wick level: ", g_h1_leg_last_wick);
       }
-      // Condition 2: two consecutive bearish H1 candles
-      if (cl1 < op1)
-         g_retrace_bar_count++;
       else
-         g_retrace_bar_count = 0;
-
-      if (g_retrace_bar_count >= 2)
       {
-         g_state             = STATE_BULL;
-         g_retrace_bar_count = 0;
-         Print("H1 retrace confirmed (bull) | 2 consecutive bearish H1 candles");
+         // Bearish candle – check if body closes below the last leg candle's wick
+         if (body_bot < g_h1_leg_last_wick)
+         {
+            g_state = STATE_BULL;
+            Print("H1 retrace started (bull) | Body closed below wick: ", g_h1_leg_last_wick);
+         }
       }
    }
-   else if (g_state == STATE_BEAR_RETRACE)
+   else // STATE_BEAR_RETRACE
    {
-      // Condition 1: bullish H1 body closes above the BOS candle's upper wick
-      if (body_top > g_h1_retrace_level)
+      if (cl1 < op1)
       {
-         g_state             = STATE_BEAR;
-         g_retrace_bar_count = 0;
-         Print("H1 retrace confirmed (bear) | H1 body closed above wick: ", g_h1_retrace_level);
-         return;
+         // Bearish candle – leg is still going, update the wick reference
+         g_h1_leg_last_wick = iHigh(Symbol(), PERIOD_H1, 1);
+         Print("H1 leg extended (bear) | New wick level: ", g_h1_leg_last_wick);
       }
-      // Condition 2: two consecutive bullish H1 candles
-      if (cl1 > op1)
-         g_retrace_bar_count++;
       else
-         g_retrace_bar_count = 0;
-
-      if (g_retrace_bar_count >= 2)
       {
-         g_state             = STATE_BEAR;
-         g_retrace_bar_count = 0;
-         Print("H1 retrace confirmed (bear) | 2 consecutive bullish H1 candles");
+         // Bullish candle – check if body closes above the last leg candle's wick
+         if (body_top > g_h1_leg_last_wick)
+         {
+            g_state = STATE_BEAR;
+            Print("H1 retrace started (bear) | Body closed above wick: ", g_h1_leg_last_wick);
+         }
       }
    }
 }
