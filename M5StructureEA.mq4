@@ -27,8 +27,11 @@
 //+------------------------------------------------------------------+
 #property copyright ""
 #property link      ""
-#property version   "2.00"
+#property version   "2.01"
 #property strict
+
+//--- Signal inversion
+input bool   InpInvertSignals      = false; // Invert signals: bull setup→SELL, bear setup→BUY
 
 //--- H1 bias filter
 input bool   InpUseH1Filter        = true;  // Enable H1 direction filter
@@ -95,7 +98,8 @@ int OnInit()
    Print("M5StructureEA v2 | Symbol: ", Symbol(),
          " | Digits: ", Digits,
          " | Pip: ",    g_pip,
-         " | H1 filter: ", (InpUseH1Filter ? "ON" : "OFF"));
+         " | H1 filter: ", (InpUseH1Filter ? "ON" : "OFF"),
+         " | Inverted: ", (InpInvertSignals ? "YES" : "NO"));
    return INIT_SUCCEEDED;
 }
 
@@ -370,47 +374,51 @@ void CheckBullEntry(bool bull, double op, double cl, double lo, double hi)
       return;
    }
 
-   double sl   = lo - InpSLBufferPips * g_pip;
-   double risk = Ask - sl;
+   double sl, risk, tp, lots;
+   int    ticket;
 
-   if (risk <= 0)
+   if (!InpInvertSignals)
    {
-      Print("Invalid risk (SL at or above Ask) – skipped");
-      g_state          = STATE_BULL_PULLBACK;
-      g_pullback_count = 0;
-      return;
-   }
-
-   double tp   = Ask + risk * InpRRRatio;
-   double lots = CalculateLots(risk);
-
-   if (lots <= 0)
-   {
-      Print("Lot size error – skipped");
-      g_state          = STATE_BULL_PULLBACK;
-      g_pullback_count = 0;
-      return;
-   }
-
-   int ticket = OrderSend(Symbol(), OP_BUY, lots, Ask, InpSlippage,
-                          NormalizeDouble(sl, Digits),
-                          NormalizeDouble(tp, Digits),
-                          InpComment, InpMagicNumber, 0, clrGreen);
-   if (ticket > 0)
-   {
-      Print("LONG opened | Ask: ", Ask,
-            " | SL: ", sl, " | TP: ", tp,
-            " | RR: 1:", InpRRRatio,
-            " | Lots: ", lots,
-            " | H1: ", H1BiasLabel(),
-            " | Ticket: ", ticket);
-      g_state             = STATE_BULL_PULLBACK;
-      g_pullback_count    = 0;
-      g_entry_bars_waited = 0;
+      // Normal: bull signal → BUY
+      sl   = lo - InpSLBufferPips * g_pip;
+      risk = Ask - sl;
+      if (risk <= 0) { Print("Invalid risk – skipped"); g_state = STATE_BULL_PULLBACK; g_pullback_count = 0; return; }
+      tp   = Ask + risk * InpRRRatio;
+      lots = CalculateLots(risk);
+      if (lots <= 0) { Print("Lot size error – skipped"); g_state = STATE_BULL_PULLBACK; g_pullback_count = 0; return; }
+      ticket = OrderSend(Symbol(), OP_BUY, lots, Ask, InpSlippage,
+                         NormalizeDouble(sl, Digits), NormalizeDouble(tp, Digits),
+                         InpComment, InpMagicNumber, 0, clrGreen);
+      if (ticket > 0)
+         Print("LONG opened | Ask: ", Ask, " | SL: ", sl, " | TP: ", tp,
+               " | RR: 1:", InpRRRatio, " | Lots: ", lots, " | H1: ", H1BiasLabel(), " | Ticket: ", ticket);
+      else
+         Print("OrderSend BUY failed | Error: ", GetLastError());
    }
    else
    {
-      Print("OrderSend BUY failed | Error: ", GetLastError());
+      // Inverted: bull signal → SELL
+      sl   = hi + InpSLBufferPips * g_pip;
+      risk = sl - Bid;
+      if (risk <= 0) { Print("Invalid risk – skipped"); g_state = STATE_BULL_PULLBACK; g_pullback_count = 0; return; }
+      tp   = Bid - risk * InpRRRatio;
+      lots = CalculateLots(risk);
+      if (lots <= 0) { Print("Lot size error – skipped"); g_state = STATE_BULL_PULLBACK; g_pullback_count = 0; return; }
+      ticket = OrderSend(Symbol(), OP_SELL, lots, Bid, InpSlippage,
+                         NormalizeDouble(sl, Digits), NormalizeDouble(tp, Digits),
+                         InpComment + "_INV", InpMagicNumber, 0, clrOrange);
+      if (ticket > 0)
+         Print("SHORT (inv) opened | Bid: ", Bid, " | SL: ", sl, " | TP: ", tp,
+               " | RR: 1:", InpRRRatio, " | Lots: ", lots, " | H1: ", H1BiasLabel(), " | Ticket: ", ticket);
+      else
+         Print("OrderSend SELL (inv) failed | Error: ", GetLastError());
+   }
+
+   if (ticket > 0)
+   {
+      g_state             = STATE_BULL_PULLBACK;
+      g_pullback_count    = 0;
+      g_entry_bars_waited = 0;
    }
 }
 
@@ -458,47 +466,51 @@ void CheckBearEntry(bool bull, double op, double cl, double hi, double lo)
       return;
    }
 
-   double sl   = hi + InpSLBufferPips * g_pip;
-   double risk = sl - Bid;
+   double sl, risk, tp, lots;
+   int    ticket;
 
-   if (risk <= 0)
+   if (!InpInvertSignals)
    {
-      Print("Invalid risk (SL at or below Bid) – skipped");
-      g_state          = STATE_BEAR_PULLBACK;
-      g_pullback_count = 0;
-      return;
-   }
-
-   double tp   = Bid - risk * InpRRRatio;
-   double lots = CalculateLots(risk);
-
-   if (lots <= 0)
-   {
-      Print("Lot size error – skipped");
-      g_state          = STATE_BEAR_PULLBACK;
-      g_pullback_count = 0;
-      return;
-   }
-
-   int ticket = OrderSend(Symbol(), OP_SELL, lots, Bid, InpSlippage,
-                          NormalizeDouble(sl, Digits),
-                          NormalizeDouble(tp, Digits),
-                          InpComment, InpMagicNumber, 0, clrRed);
-   if (ticket > 0)
-   {
-      Print("SHORT opened | Bid: ", Bid,
-            " | SL: ", sl, " | TP: ", tp,
-            " | RR: 1:", InpRRRatio,
-            " | Lots: ", lots,
-            " | H1: ", H1BiasLabel(),
-            " | Ticket: ", ticket);
-      g_state             = STATE_BEAR_PULLBACK;
-      g_pullback_count    = 0;
-      g_entry_bars_waited = 0;
+      // Normal: bear signal → SELL
+      sl   = hi + InpSLBufferPips * g_pip;
+      risk = sl - Bid;
+      if (risk <= 0) { Print("Invalid risk – skipped"); g_state = STATE_BEAR_PULLBACK; g_pullback_count = 0; return; }
+      tp   = Bid - risk * InpRRRatio;
+      lots = CalculateLots(risk);
+      if (lots <= 0) { Print("Lot size error – skipped"); g_state = STATE_BEAR_PULLBACK; g_pullback_count = 0; return; }
+      ticket = OrderSend(Symbol(), OP_SELL, lots, Bid, InpSlippage,
+                         NormalizeDouble(sl, Digits), NormalizeDouble(tp, Digits),
+                         InpComment, InpMagicNumber, 0, clrRed);
+      if (ticket > 0)
+         Print("SHORT opened | Bid: ", Bid, " | SL: ", sl, " | TP: ", tp,
+               " | RR: 1:", InpRRRatio, " | Lots: ", lots, " | H1: ", H1BiasLabel(), " | Ticket: ", ticket);
+      else
+         Print("OrderSend SELL failed | Error: ", GetLastError());
    }
    else
    {
-      Print("OrderSend SELL failed | Error: ", GetLastError());
+      // Inverted: bear signal → BUY
+      sl   = lo - InpSLBufferPips * g_pip;
+      risk = Ask - sl;
+      if (risk <= 0) { Print("Invalid risk – skipped"); g_state = STATE_BEAR_PULLBACK; g_pullback_count = 0; return; }
+      tp   = Ask + risk * InpRRRatio;
+      lots = CalculateLots(risk);
+      if (lots <= 0) { Print("Lot size error – skipped"); g_state = STATE_BEAR_PULLBACK; g_pullback_count = 0; return; }
+      ticket = OrderSend(Symbol(), OP_BUY, lots, Ask, InpSlippage,
+                         NormalizeDouble(sl, Digits), NormalizeDouble(tp, Digits),
+                         InpComment + "_INV", InpMagicNumber, 0, clrBlue);
+      if (ticket > 0)
+         Print("LONG (inv) opened | Ask: ", Ask, " | SL: ", sl, " | TP: ", tp,
+               " | RR: 1:", InpRRRatio, " | Lots: ", lots, " | H1: ", H1BiasLabel(), " | Ticket: ", ticket);
+      else
+         Print("OrderSend BUY (inv) failed | Error: ", GetLastError());
+   }
+
+   if (ticket > 0)
+   {
+      g_state             = STATE_BEAR_PULLBACK;
+      g_pullback_count    = 0;
+      g_entry_bars_waited = 0;
    }
 }
 
