@@ -80,11 +80,11 @@ double   g_bos_close          = 0;   // Close of the M5 candle that created the 
 double   g_bos_bar_high       = 0;
 double   g_bos_bar_low        = 0;
 bool     g_pullback_seen      = false;
+int      g_pullback_count     = 0;   // consecutive opposite-direction candles toward pullback
 
 // Scale-in tracking
-// Reset to false each time an entry (initial or scale) is placed.
-// Set to true when a pullback candle is detected after that entry.
-bool     g_scale_pullback_seen = false;
+bool     g_scale_pullback_seen  = false;
+int      g_scale_pullback_count = 0; // consecutive opposite-direction candles toward scale pullback
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
@@ -269,11 +269,12 @@ void LookForBullishM5BOS()
 
    if (cl1 > m5_sh)
    {
-      g_state         = STATE_BULL_BOS;
-      g_bos_close     = cl1;
-      g_bos_bar_high  = iHigh(Symbol(), PERIOD_M5, 1);
-      g_bos_bar_low   = iLow (Symbol(), PERIOD_M5, 1);
-      g_pullback_seen = false;
+      g_state           = STATE_BULL_BOS;
+      g_bos_close       = cl1;
+      g_bos_bar_high    = iHigh(Symbol(), PERIOD_M5, 1);
+      g_bos_bar_low     = iLow (Symbol(), PERIOD_M5, 1);
+      g_pullback_seen   = false;
+      g_pullback_count  = 0;
       Print("M5 Bullish BOS | Level: ", m5_sh, " | M5 Close: ", cl1);
    }
 }
@@ -291,11 +292,12 @@ void LookForBearishM5BOS()
 
    if (cl1 < m5_sl)
    {
-      g_state         = STATE_BEAR_BOS;
-      g_bos_close     = cl1;
-      g_bos_bar_high  = iHigh(Symbol(), PERIOD_M5, 1);
-      g_bos_bar_low   = iLow (Symbol(), PERIOD_M5, 1);
-      g_pullback_seen = false;
+      g_state           = STATE_BEAR_BOS;
+      g_bos_close       = cl1;
+      g_bos_bar_high    = iHigh(Symbol(), PERIOD_M5, 1);
+      g_bos_bar_low     = iLow (Symbol(), PERIOD_M5, 1);
+      g_pullback_seen   = false;
+      g_pullback_count  = 0;
       Print("M5 Bearish BOS | Level: ", m5_sl, " | M5 Close: ", cl1);
    }
 }
@@ -314,18 +316,25 @@ void CheckBullishEntry()
    // Top of the previous candle's body (ignores the wick)
    double body_top2 = MathMax(iOpen(Symbol(), PERIOD_M5, 2), iClose(Symbol(), PERIOD_M5, 2));
 
-   // Step 1 – detect pullback after BOS
+   // Step 1 – detect pullback: requires 2 consecutive bearish M5 candles
    if (!g_pullback_seen)
    {
-      if (cl1 < g_bos_close)
+      double op1_pb = iOpen(Symbol(), PERIOD_M5, 1);
+      if (cl1 < op1_pb)
+         g_pullback_count++;
+      else
+         g_pullback_count = 0;  // bullish candle resets the count
+
+      if (g_pullback_count >= 2)
       {
-         g_pullback_seen = true;
-         Print("Pullback detected after M5 Bullish BOS | Bar close: ", cl1);
+         g_pullback_seen  = true;
+         g_pullback_count = 0;
+         Print("Pullback confirmed (bull) | 2 consecutive bearish M5 candles");
       }
       return;
    }
 
-   // Step 2 – entry confirmation: candle body closes above the previous candle's body top
+   // Step 2 – entry: candle in bias direction closes above the last pullback candle's body
    if (cl1 > body_top2)
    {
       double sl   = lo1 - InpSLBufferPips * g_pip;
@@ -342,8 +351,9 @@ void CheckBullishEntry()
                              sl, tp, InpComment, InpMagicNumber, 0, clrGreen);
       if (ticket > 0)
       {
-         g_state              = STATE_BULL_SCALE;
-         g_scale_pullback_seen = false;
+         g_state               = STATE_BULL_SCALE;
+         g_scale_pullback_seen  = false;
+         g_scale_pullback_count = 0;
          Print("LONG opened | Ask: ", Ask,
                " | SL: ", sl,
                " | TP: ", tp,
@@ -372,18 +382,25 @@ void CheckBearishEntry()
    // Bottom of the previous candle's body (ignores the wick)
    double body_bot2 = MathMin(iOpen(Symbol(), PERIOD_M5, 2), iClose(Symbol(), PERIOD_M5, 2));
 
-   // Step 1 – detect pullback after BOS
+   // Step 1 – detect pullback: requires 2 consecutive bullish M5 candles
    if (!g_pullback_seen)
    {
-      if (cl1 > g_bos_close)
+      double op1_pb = iOpen(Symbol(), PERIOD_M5, 1);
+      if (cl1 > op1_pb)
+         g_pullback_count++;
+      else
+         g_pullback_count = 0;  // bearish candle resets the count
+
+      if (g_pullback_count >= 2)
       {
-         g_pullback_seen = true;
-         Print("Pullback detected after M5 Bearish BOS | Bar close: ", cl1);
+         g_pullback_seen  = true;
+         g_pullback_count = 0;
+         Print("Pullback confirmed (bear) | 2 consecutive bullish M5 candles");
       }
       return;
    }
 
-   // Step 2 – entry confirmation: candle body closes below the previous candle's body bottom
+   // Step 2 – entry: candle in bias direction closes below the last pullback candle's body
    if (cl1 < body_bot2)
    {
       double sl   = hi1 + InpSLBufferPips * g_pip;
@@ -400,8 +417,9 @@ void CheckBearishEntry()
                              sl, tp, InpComment, InpMagicNumber, 0, clrRed);
       if (ticket > 0)
       {
-         g_state               = STATE_BEAR_SCALE;
-         g_scale_pullback_seen = false;
+         g_state                = STATE_BEAR_SCALE;
+         g_scale_pullback_seen  = false;
+         g_scale_pullback_count = 0;
          Print("SHORT opened | Bid: ", Bid,
                " | SL: ", sl,
                " | TP: ", tp,
@@ -517,13 +535,19 @@ void CheckBullishScaleIn()
    double cl2 = iClose(Symbol(), PERIOD_M5, 2);
    double lo1 = iLow  (Symbol(), PERIOD_M5, 1);
 
-   // Step 1 – detect pullback: any bearish M5 candle after the last entry
+   // Step 1 – detect pullback: 2 consecutive bearish M5 candles after the last entry
    if (!g_scale_pullback_seen)
    {
       if (cl1 < op1)
+         g_scale_pullback_count++;
+      else
+         g_scale_pullback_count = 0;
+
+      if (g_scale_pullback_count >= 2)
       {
-         g_scale_pullback_seen = true;
-         Print("Scale-in pullback detected (bull) | M5 close: ", cl1);
+         g_scale_pullback_seen  = true;
+         g_scale_pullback_count = 0;
+         Print("Scale-in pullback confirmed (bull) | 2 consecutive bearish M5 candles");
       }
       return;
    }
@@ -544,7 +568,8 @@ void CheckBullishScaleIn()
                              sl, tp, InpComment + "_SI", InpMagicNumber, 0, clrBlue);
       if (ticket > 0)
       {
-         g_scale_pullback_seen = false;
+         g_scale_pullback_seen  = false;
+         g_scale_pullback_count = 0;
          Print("SCALE-IN LONG | Ask: ", Ask,
                " | SL: ", sl, " | TP: ", tp,
                " | Lots: ", lots, " | Ticket: ", ticket);
@@ -572,13 +597,19 @@ void CheckBearishScaleIn()
    double cl2 = iClose(Symbol(), PERIOD_M5, 2);
    double hi1 = iHigh (Symbol(), PERIOD_M5, 1);
 
-   // Step 1 – detect pullback: any bullish M5 candle after the last entry
+   // Step 1 – detect pullback: 2 consecutive bullish M5 candles after the last entry
    if (!g_scale_pullback_seen)
    {
       if (cl1 > op1)
+         g_scale_pullback_count++;
+      else
+         g_scale_pullback_count = 0;
+
+      if (g_scale_pullback_count >= 2)
       {
-         g_scale_pullback_seen = true;
-         Print("Scale-in pullback detected (bear) | M5 close: ", cl1);
+         g_scale_pullback_seen  = true;
+         g_scale_pullback_count = 0;
+         Print("Scale-in pullback confirmed (bear) | 2 consecutive bullish M5 candles");
       }
       return;
    }
@@ -599,7 +630,8 @@ void CheckBearishScaleIn()
                              sl, tp, InpComment + "_SI", InpMagicNumber, 0, clrOrange);
       if (ticket > 0)
       {
-         g_scale_pullback_seen = false;
+         g_scale_pullback_seen  = false;
+         g_scale_pullback_count = 0;
          Print("SCALE-IN SHORT | Bid: ", Bid,
                " | SL: ", sl, " | TP: ", tp,
                " | Lots: ", lots, " | Ticket: ", ticket);
