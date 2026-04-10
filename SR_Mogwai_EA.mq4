@@ -17,7 +17,9 @@
 //--- Input Parameters
 extern int    SwingLookback   = 10;     // Bars left/right to confirm swing point
 extern int    SRLookback      = 300;    // How many bars to scan for S/R levels
-extern double ZoneBuffer      = 5.0;   // Zone half-width in points (5pt = 0.5pip on 5-digit)
+extern double ZoneBuffer      = 5.0;   // Zone half-width in PIPS (auto-scaled per instrument)
+                                        //   Forex:  5 pips = ~0.0005 on EURUSD
+                                        //   Gold:   5 pips = $5.00 on XAUUSD — lower to 2-3
 extern double LevelMergePips  = 3.0;   // Merge levels within this many pips
 extern int    MinTouches      = 2;     // Min touches to validate a level
 extern int    MaxLevels       = 30;    // Max S/R levels to track
@@ -25,7 +27,8 @@ extern int    MaxLevels       = 30;    // Max S/R levels to track
 extern double RiskPercent     = 1.0;   // % of balance to risk per trade
 extern double RiskReward      = 2.0;   // Minimum risk:reward ratio
 extern int    ATR_Period      = 14;    // ATR period for stop placement
-extern double ATR_SL_Multi    = 1.5;   // ATR multiplier beyond zone for stop loss
+extern double ATR_SL_Multi    = 2.0;   // ATR multiplier beyond zone for stop loss
+                                        //   Gold needs wider stops — default raised to 2.0
 
 extern bool   UsePinBars      = true;  // Enable pin bar entries
 extern bool   UseEngulfing    = true;  // Enable engulfing entries
@@ -33,7 +36,8 @@ extern double PinBodyRatio    = 0.3;   // Max body/range ratio for pin bar
 extern double PinWickRatio    = 0.6;   // Min dominant wick/range ratio for pin bar
 
 extern int    MagicNumber     = 78432; // EA magic number
-extern int    Slippage        = 3;     // Max slippage in points
+extern int    Slippage        = 10;    // Max slippage in points
+                                        //   Gold: 10 × $0.01 = $0.10 slippage tolerance
 
 extern bool   DrawLevels      = true;  // Draw S/R levels on chart
 extern color  ResistanceColor = clrCrimson;
@@ -66,7 +70,12 @@ int OnInit()
         Alert("SR_Mogwai_EA: Designed for M5 or M15 timeframes.");
         return INIT_FAILED;
     }
-    Print("SR_Mogwai_EA initialized on ", Symbol(), " ", Period(), "min");
+    double pip = GetPipSize();
+    Print("SR_Mogwai_EA initialized on ", Symbol(), " M", Period(),
+          " | Digits=", Digits,
+          " Point=", DoubleToStr(Point, Digits),
+          " PipSize=", DoubleToStr(pip, Digits),
+          " ZoneWidth=", DoubleToStr(ZoneBuffer * pip, Digits));
     return INIT_SUCCEEDED;
 }
 
@@ -173,7 +182,7 @@ void BuildSRLevels()
     }
 
     // --- Add touches from historical closes ---
-    double zoneWidth = ZoneBuffer * Point;
+    double zoneWidth = ZoneBuffer * GetPipSize();
     for(int c = 0; c < clusterCount; c++)
     {
         for(int i = 1; i < available; i++)
@@ -222,7 +231,7 @@ void CheckEntrySignals()
     double atr = iATR(NULL, 0, ATR_Period, 1);
     if(atr <= 0) return;
 
-    double zoneWidth = ZoneBuffer * Point;
+    double zoneWidth = ZoneBuffer * GetPipSize();
 
     for(int i = 0; i < levelCount; i++)
     {
@@ -486,12 +495,29 @@ bool HasOpenPosition()
 }
 
 //+------------------------------------------------------------------+
-//| Get pip size (handles 3/5-digit brokers)                         |
+//| Get pip size — handles forex, gold, silver, and indices          |
+//|                                                                  |
+//|  Instrument  Digits  Point    Pip multiplier  Result            |
+//|  XAUUSD       2      0.01     × 100           $1.00             |
+//|  XAGUSD       3      0.001    × 100           $0.10             |
+//|  USDJPY 3dig  3      0.001    × 10            0.01              |
+//|  EURUSD 5dig  5      0.00001  × 10            0.0001            |
+//|  EURUSD 4dig  4      0.0001   × 1             0.0001            |
 //+------------------------------------------------------------------+
 double GetPipSize()
 {
+    string sym = Symbol();
+
+    // Precious metals: XAU (gold), XAG (silver)
+    if(StringFind(sym, "XAU")    >= 0 || StringFind(sym, "GOLD")   >= 0 ||
+       StringFind(sym, "XAG")    >= 0 || StringFind(sym, "SILVER") >= 0)
+        return Point * 100;
+
+    // Standard 3-digit JPY or 5-digit forex
     if(Digits == 3 || Digits == 5)
         return Point * 10;
+
+    // Standard 2-digit JPY or 4-digit forex
     return Point;
 }
 
