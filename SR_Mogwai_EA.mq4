@@ -1,7 +1,7 @@
 //+------------------------------------------------------------------+
 //|                                              SR_Mogwai_EA.mq4    |
 //|                  Support & Resistance EA - Mogwai Style          |
-//|                         v2.0 - Gold Optimised                    |
+//|                         v2.1 - Drawdown Fixes                    |
 //|                                                                  |
 //|  Changelog v2.0:                                                 |
 //|  - Fixed FindNextLevel direction logic (was inverted)            |
@@ -12,10 +12,17 @@
 //|  - Added daily trade cap and daily loss cap                      |
 //|  - Tightened zone interaction (candle must come from right side) |
 //|  - Reduced default RiskPercent 1.0 → 0.5                       |
+//|  Changelog v2.1:                                                 |
+//|  - BE_ActivationATR 0.8 → 1.5 (stops immediate M5 noise hits)  |
+//|  - BE_LockPips 3 → 10 ($10 lock survives Gold M5 noise)        |
+//|  - Added MaxSL_Pips hard cap (default $20) — skips entry when   |
+//|    ATR-based stop > cap; eliminates $40-48 outlier losses        |
+//|  - Added min-lot actual-risk guard: skips trade if 0.01 lots    |
+//|    forces >3× intended risk (prevents small-account overexposure)|
 //+------------------------------------------------------------------+
 #property copyright "SR Mogwai EA v2.0"
 #property link      ""
-#property version   "2.00"
+#property version   "2.10"
 #property strict
 
 //--- S/R Level Detection
@@ -28,15 +35,21 @@ extern int    MaxLevels        = 30;   // Max levels to track
 extern int    LevelCooldownBars= 20;   // Bars to skip after signal at a level
 
 //--- Risk Management
-extern double RiskPercent      = 0.5;  // % of balance per trade (halved from v1)
+extern double RiskPercent      = 0.5;  // % of balance per trade
 extern double RiskReward       = 2.0;  // Minimum acceptable R:R
 extern int    ATR_Period       = 14;   // ATR period
 extern double ATR_SL_Multi     = 2.0;  // ATR × this = stop distance beyond zone
+extern double MaxSL_Pips       = 20.0; // Hard cap: skip trade if SL > this many pips from entry
+                                        //   Gold: $20 max SL. Prevents $48 disasters during
+                                        //   high-ATR sessions. 0 = disabled.
 
 //--- Trade Management
 extern bool   UseBreakeven     = true; // Move SL to breakeven
-extern double BE_ActivationATR = 0.8;  // Activate BE when profit >= ATR × this
-extern double BE_LockPips      = 3.0;  // Pips to lock in at breakeven (Gold: $3)
+extern double BE_ActivationATR = 1.5;  // Activate BE when profit >= ATR × this
+                                        //   0.8 was triggering inside M5 bar noise on Gold
+                                        //   1.5 requires a meaningful move before locking in
+extern double BE_LockPips      = 10.0; // Pips to lock in at breakeven (Gold: $10)
+                                        //   $3 was reversed in <1 min; $10 survives normal noise
 extern bool   UseTrailingStop  = false;// Trail SL after breakeven
 extern double TrailingATR      = 2.0;  // Trail distance in ATR multiples
 
@@ -277,6 +290,20 @@ void CheckEntrySignals()
             double risk = Ask - sl;
             if(risk <= 0 || risk > atr * 5) continue;
 
+            // Hard cap: skip if SL is wider than MaxSL_Pips (e.g. high-ATR news periods)
+            if(MaxSL_Pips > 0 && risk > MaxSL_Pips * pip) continue;
+
+            // Skip if minimum lot forces actual risk >3× intended (account too small for this SL)
+            double intendedRisk = AccountBalance() * (RiskPercent / 100.0);
+            double minLot       = MarketInfo(Symbol(), MODE_MINLOT);
+            double tickVal      = MarketInfo(Symbol(), MODE_TICKVALUE);
+            double tickSz       = MarketInfo(Symbol(), MODE_TICKSIZE);
+            if(tickSz > 0 && tickVal > 0)
+            {
+                double actualRiskAtMinLot = minLot * risk * (tickVal / tickSz);
+                if(actualRiskAtMinLot > intendedRisk * 3.0) continue;
+            }
+
             double tp = FindNextResistance(level, pip);
             if(tp <= 0 || (tp - Ask) < risk * RiskReward)
                 tp = Ask + risk * RiskReward;
@@ -320,6 +347,20 @@ void CheckEntrySignals()
             double sl   = level + atr * ATR_SL_Multi;
             double risk = sl - Bid;
             if(risk <= 0 || risk > atr * 5) continue;
+
+            // Hard cap: skip if SL is wider than MaxSL_Pips
+            if(MaxSL_Pips > 0 && risk > MaxSL_Pips * pip) continue;
+
+            // Skip if minimum lot forces actual risk >3× intended
+            double intendedRisk2 = AccountBalance() * (RiskPercent / 100.0);
+            double minLot2       = MarketInfo(Symbol(), MODE_MINLOT);
+            double tickVal2      = MarketInfo(Symbol(), MODE_TICKVALUE);
+            double tickSz2       = MarketInfo(Symbol(), MODE_TICKSIZE);
+            if(tickSz2 > 0 && tickVal2 > 0)
+            {
+                double actualRiskAtMinLot2 = minLot2 * risk * (tickVal2 / tickSz2);
+                if(actualRiskAtMinLot2 > intendedRisk2 * 3.0) continue;
+            }
 
             double tp = FindNextSupport(level, pip);
             if(tp <= 0 || (Bid - tp) < risk * RiskReward)
