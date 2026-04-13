@@ -17,7 +17,7 @@
 //|                                                                   |
 //|  3. M5 Entry – classic engulfing candle at the S/R zone          |
 //|     a. The candle BEFORE the trigger (bar[2]) must touch the      |
-//|        S/R zone (within InpSRBuffer pips of the level).          |
+//|        S/R zone (within InpZoneATRMult × M15 ATR of the level).  |
 //|     b. The latest closed M5 candle (bar[1]) must be a classic    |
 //|        engulfing candle in the bias direction:                    |
 //|        Bull: bar[2] bearish → bar[1] bullish body covers bar[2]  |
@@ -27,14 +27,14 @@
 //|                                                                   |
 //|  4. Stop Loss & Take Profit                                       |
 //|     SL  – below bar[1] low  (bull) / above bar[1] high (bear)   |
-//|           + InpSLBufferPips                                       |
+//|           + InpSLBufferATRMult × M5 ATR(14)                      |
 //|     TP  – account-balance based: (InpTPPercent / InpRiskPercent) |
 //|           × SL distance.  Default 3 % TP / 1 % risk = 1:3 RR.   |
 //|                                                                   |
 //|  Extra filters (all configurable, on by default where shown)     |
 //|  ─────────────────────────────────────────────────────────────── |
 //|  • Session filter   – skip trades outside InpSessionStart/End    |
-//|  • Spread guard     – skip if spread > InpMaxSpreadPips          |
+//|  • Spread guard     – skip if spread > InpMaxSpreadATRMult×ATR   |
 //|  • ATR body filter  – engulfing candle body must be ≥            |
 //|                        InpMinBodyATR × ATR(14); keeps only        |
 //|                        meaningful momentum candles               |
@@ -54,7 +54,9 @@ input int    InpM15SwingBars    = 3;    // M15 pivot: bars on each side to confi
 input int    InpM15Lookback     = 80;   // M15 bars to scan for swing structure
 
 // --- S/R Zone ---
-input double InpSRBuffer        = 5.0;  // S/R zone half-width (pips); defines the "touch zone"
+// Zone width = InpZoneATRMult × M15 ATR(14).  Scales automatically to any
+// instrument.  0.5 means bar[2] must trade within half an M15 ATR of the level.
+input double InpZoneATRMult     = 0.5;  // S/R zone half-width (× M15 ATR-14)
 
 // --- Entry Quality ---
 input double InpMinBodyATR      = 0.3;  // Min engulfing body as fraction of M5 ATR(14); 0 = disabled
@@ -62,15 +64,19 @@ input double InpMinBodyATR      = 0.3;  // Min engulfing body as fraction of M5 
 // --- Risk & Reward ---
 input double InpRiskPercent     = 1.0;  // Risk per trade (% of account balance)
 input double InpTPPercent       = 3.0;  // Take-profit target (% of account balance)
-input double InpSLBufferPips    = 3.0;  // Extra pip buffer added to stop loss
+// SL extra buffer = InpSLBufferATRMult × M5 ATR(14).
+// 0.15 ≈ 1.5 pips on EURUSD (ATR≈10p), ≈ $0.75 on XAUUSD (ATR≈$5).
+input double InpSLBufferATRMult = 0.15; // SL extra buffer (× M5 ATR-14)
 
 // --- Spread Guard ---
-input double InpMaxSpreadPips   = 3.0;  // Max allowed spread in pips before skipping entry
+// Max spread = InpMaxSpreadATRMult × M5 ATR(14).
+// 0.20 ≈ 2 pips on EURUSD, ≈ $1 on XAUUSD.  Blocks news-spike entries.
+input double InpMaxSpreadATRMult= 0.20; // Max allowed spread (× M5 ATR-14)
 
 // --- Session Filter ---
 input bool   InpUseSession      = true; // Restrict entries to session window
 input int    InpSessionStart    = 8;    // Session open  hour, server time (0-23)
-input int    InpSessionEnd      = 17;   // Session close hour, server time (0-23)
+input int    InpSessionEnd      = 21;   // Session close hour, server time (0-23)
 
 // --- Daily Trade Cap ---
 input int    InpMaxDailyTrades  = 3;    // Max trades per calendar day; 0 = unlimited
@@ -212,8 +218,17 @@ void CheckM5Engulf()
 
    if (InpUseSession && !IsSessionActive()) return;
 
+   // ── ATR values used throughout ────────────────────────────────
+   // Calculated once here so all ATR-based thresholds stay consistent.
+   double m5_atr  = iATR(Symbol(), PERIOD_M5,  14, 1);
+   double m15_atr = iATR(Symbol(), PERIOD_M15, 14, 1);
+   if (m5_atr <= 0 || m15_atr <= 0) return;   // Not enough history yet
+
+   // Spread guard – ATR-based so it works on any instrument.
+   // e.g. XAUUSD ATR≈$5: max spread = 0.20×$5 = $1.00
+   //       EURUSD ATR≈0.0008: max spread = 0.20×0.0008 = 1.6 pips
    double spread = MarketInfo(Symbol(), MODE_SPREAD) * Point;
-   if (spread > InpMaxSpreadPips * g_pip) return;
+   if (spread > InpMaxSpreadATRMult * m5_atr) return;
 
    // Daily trade cap
    if (InpMaxDailyTrades > 0)
@@ -238,12 +253,14 @@ void CheckM5Engulf()
    // Reject doji-like candles – the engulfing candle must show real momentum.
    if (InpMinBodyATR > 0)
    {
-      double atr   = iATR(Symbol(), PERIOD_M5, 14, 1);
       double body1 = MathAbs(cl1 - op1);
-      if (atr > 0 && body1 < InpMinBodyATR * atr) return;
+      if (body1 < InpMinBodyATR * m5_atr) return;
    }
 
-   double zone = InpSRBuffer * g_pip;
+   // S/R zone half-width: InpZoneATRMult × M15 ATR(14).
+   // e.g. XAUUSD M15 ATR≈$10: zone = 0.5×$10 = $5 on either side of the level
+   double zone   = InpZoneATRMult     * m15_atr;
+   double sl_buf = InpSLBufferATRMult * m5_atr;
 
    // ══════════════════════════════════════════════════════════════
    // BULLISH SETUP – at M15 support
@@ -263,7 +280,7 @@ void CheckM5Engulf()
       if (!bear2 || !bull1 || !engulfs) return;
 
       // ── Place buy order ───────────────────────────────────────
-      double sl   = lo1 - InpSLBufferPips * g_pip;
+      double sl   = lo1 - sl_buf;
       double dist = Ask - sl;
       if (dist <= 0) return;
 
@@ -310,7 +327,7 @@ void CheckM5Engulf()
       if (!bull2 || !bear1 || !engulfs) return;
 
       // ── Place sell order ──────────────────────────────────────
-      double sl   = hi1 + InpSLBufferPips * g_pip;
+      double sl   = hi1 + sl_buf;
       double dist = sl - Bid;
       if (dist <= 0) return;
 
