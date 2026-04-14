@@ -81,6 +81,32 @@ input int    InpSessionEnd      = 21;   // Session close hour, server time (0-23
 // --- Daily Trade Cap ---
 input int    InpMaxDailyTrades  = 3;    // Max trades per calendar day; 0 = unlimited
 
+// --- H1 Trend Alignment ---
+// Only take M15 setups that agree with the H1 market structure.
+// Bull on M15 + Bull on H1 = price retesting support in a confirmed uptrend → higher hold rate.
+// Bear on M15 + Bear on H1 = price retesting resistance in a confirmed downtrend → higher hold rate.
+input bool   InpUseH1Filter     = true; // Require H1 structure to agree with M15 bias
+input int    InpH1SwingBars     = 5;    // H1 pivot: bars on each side to confirm
+input int    InpH1Lookback      = 40;   // H1 bars to scan for structure
+
+// --- RSI Momentum Filter ---
+// Checks that momentum has genuinely faded before the engulfing candle fires.
+// At support in a bullish bias, RSI should be pulling back (below InpRSIBullMax).
+// At resistance in a bearish bias, RSI should be elevated (above InpRSIBearMin).
+// Default band 40-60 is intentionally wide; tighten to 35/65 for stricter filtering.
+input bool   InpUseRSIFilter    = true; // Enable RSI momentum filter on M15
+input int    InpRSIPeriod       = 14;   // RSI period
+input double InpRSIBullMax      = 60;   // Bullish entry: M15 RSI must be ≤ this value
+input double InpRSIBearMin      = 40;   // Bearish entry: M15 RSI must be ≥ this value
+
+// --- Rejection Wick ---
+// Requires bar[2] (the zone-touching candle) to have a rejection wick showing
+// that the S/R level is actively being defended before the engulf fires.
+// Bull: bar[2] lower wick ≥ InpMinWickRatio × bar[2] body
+// Bear: bar[2] upper wick ≥ InpMinWickRatio × bar[2] body
+// Set to 0 to disable.
+input double InpMinWickRatio    = 0.5;  // Min wick-to-body ratio on the zone-touch candle
+
 // --- Misc ---
 input int    InpSlippage        = 3;    // Max slippage in points
 input int    InpMagicNumber     = 20260101;
@@ -101,6 +127,11 @@ double   g_pip            = 0;      // Pip size (0.0001 for 4-digit, 0.00001 for
 
 datetime g_m15_bar_time   = 0;
 datetime g_m5_bar_time    = 0;
+datetime g_h1_bar_time    = 0;
+
+// H1 trend state – updated on each new H1 bar, consumed in CheckM5Engulf
+bool     g_h1_bull        = false;
+bool     g_h1_bear        = false;
 
 int      g_trades_today   = 0;
 datetime g_last_day       = 0;
@@ -134,8 +165,48 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   if (IsNewBar(PERIOD_H1,  g_h1_bar_time))  CheckH1Trend();
    if (IsNewBar(PERIOD_M15, g_m15_bar_time)) CheckM15Bias();
    if (IsNewBar(PERIOD_M5,  g_m5_bar_time))  CheckM5Engulf();
+}
+
+//+------------------------------------------------------------------+
+//| H1 trend detector – runs once per H1 bar                        |
+//|                                                                  |
+//| Sets g_h1_bull / g_h1_bear by comparing the two most recent     |
+//| confirmed H1 swing highs and lows.  Cached so CheckM5Engulf can  |
+//| gate entries without re-running swing detection every M5 bar.   |
+//+------------------------------------------------------------------+
+void CheckH1Trend()
+{
+   if (!InpUseH1Filter) return;
+
+   double h1_shs[2], h1_sls[2];
+   int n_sh = FindTopNSwingHighs(PERIOD_H1, InpH1Lookback, InpH1SwingBars, h1_shs, 2);
+   int n_sl = FindTopNSwingLows (PERIOD_H1, InpH1Lookback, InpH1SwingBars, h1_sls, 2);
+
+   bool prev_bull = g_h1_bull;
+   bool prev_bear = g_h1_bear;
+
+   if (n_sh < 2 || n_sl < 2)
+   {
+      g_h1_bull = false;
+      g_h1_bear = false;
+   }
+   else
+   {
+      g_h1_bull = (h1_shs[0] > h1_shs[1]) && (h1_sls[0] > h1_sls[1]);
+      g_h1_bear = (h1_shs[0] < h1_shs[1]) && (h1_sls[0] < h1_sls[1]);
+   }
+
+   // Only print when the H1 trend label changes to keep the log clean
+   if (g_h1_bull != prev_bull || g_h1_bear != prev_bear)
+   {
+      string label = g_h1_bull ? "BULLISH" : (g_h1_bear ? "BEARISH" : "MIXED/IDLE");
+      Print("H1 Trend → ", label,
+            " | SH: ", (n_sh >= 2 ? DoubleToStr(h1_shs[1], Digits) + " → " + DoubleToStr(h1_shs[0], Digits) : "n/a"),
+            " | SL: ", (n_sl >= 2 ? DoubleToStr(h1_sls[1], Digits) + " → " + DoubleToStr(h1_sls[0], Digits) : "n/a"));
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -218,6 +289,15 @@ void CheckM5Engulf()
 
    if (InpUseSession && !IsSessionActive()) return;
 
+   // H1 trend alignment gate – skip if H1 structure disagrees with M15 bias.
+   // Filter is only meaningful when H1 has a clear direction; if H1 is mixed
+   // (g_h1_bull = false && g_h1_bear = false) the entry is also blocked.
+   if (InpUseH1Filter)
+   {
+      if (g_state == STATE_BULL && !g_h1_bull) return;
+      if (g_state == STATE_BEAR && !g_h1_bear) return;
+   }
+
    // ── ATR values used throughout ────────────────────────────────
    // Calculated once here so all ATR-based thresholds stay consistent.
    double m5_atr  = iATR(Symbol(), PERIOD_M5,  14, 1);
@@ -270,6 +350,15 @@ void CheckM5Engulf()
       // bar[2] must have dipped into the support zone
       if (lo2 > g_sr_level + zone) return;
 
+      // M15 RSI must confirm the pullback is genuine.
+      // RSI above InpRSIBullMax means buyers are still dominant at this level
+      // and the support may not hold (momentum hasn't faded yet).
+      if (InpUseRSIFilter)
+      {
+         double rsi = iRSI(Symbol(), PERIOD_M15, InpRSIPeriod, PRICE_CLOSE, 1);
+         if (rsi > InpRSIBullMax) return;
+      }
+
       // Classic bullish engulfing:
       //   bar[2] is bearish, bar[1] is bullish,
       //   bar[1] body fully covers bar[2] body
@@ -278,6 +367,16 @@ void CheckM5Engulf()
       bool engulfs = (op1 <= cl2) && (cl1 >= op2);
 
       if (!bear2 || !bull1 || !engulfs) return;
+
+      // Rejection wick: bar[2] lower wick must be ≥ InpMinWickRatio × bar[2] body.
+      // A meaningful wick shows sellers tested below the support and were absorbed –
+      // the level is actively defended, not just grazed.
+      if (InpMinWickRatio > 0)
+      {
+         double body2       = op2 - cl2;    // bearish body (op2 > cl2)
+         double lower_wick2 = cl2 - lo2;   // distance below close to candle low
+         if (body2 > 0 && lower_wick2 < InpMinWickRatio * body2) return;
+      }
 
       // ── Place buy order ───────────────────────────────────────
       double sl   = lo1 - sl_buf;
@@ -317,6 +416,15 @@ void CheckM5Engulf()
       // bar[2] must have spiked into the resistance zone
       if (hi2 < g_sr_level - zone) return;
 
+      // M15 RSI must confirm the bounce is genuinely exhausted.
+      // RSI below InpRSIBearMin means sellers are still dominant at this level
+      // and the resistance may not hold (upside momentum hasn't built yet).
+      if (InpUseRSIFilter)
+      {
+         double rsi = iRSI(Symbol(), PERIOD_M15, InpRSIPeriod, PRICE_CLOSE, 1);
+         if (rsi < InpRSIBearMin) return;
+      }
+
       // Classic bearish engulfing:
       //   bar[2] is bullish, bar[1] is bearish,
       //   bar[1] body fully covers bar[2] body
@@ -325,6 +433,16 @@ void CheckM5Engulf()
       bool engulfs = (op1 >= cl2) && (cl1 <= op2);
 
       if (!bull2 || !bear1 || !engulfs) return;
+
+      // Rejection wick: bar[2] upper wick must be ≥ InpMinWickRatio × bar[2] body.
+      // A meaningful upper wick shows buyers tried to push through the resistance
+      // and were rejected – the level is actively capping price.
+      if (InpMinWickRatio > 0)
+      {
+         double body2       = cl2 - op2;    // bullish body (cl2 > op2)
+         double upper_wick2 = hi2 - cl2;   // distance above close to candle high
+         if (body2 > 0 && upper_wick2 < InpMinWickRatio * body2) return;
+      }
 
       // ── Place sell order ──────────────────────────────────────
       double sl   = hi1 + sl_buf;
