@@ -388,13 +388,15 @@ void ManageTrailingStops() {
             if (Bid >= entryPrice + riskDist && currentSL < beLevel) {
                 newSL = NormalizeDouble(beLevel, Digits);
                 if (newSL > currentSL)
-                    OrderModify(OrderTicket(), entryPrice, newSL, currentTP, 0, clrGreen);
+                    if (!OrderModify(OrderTicket(), entryPrice, newSL, currentTP, 0, clrGreen))
+                        Print("OrderModify (BE long) failed. Error:", GetLastError());
             }
             // Phase 2: Trail stop at 50% of risk dist behind price after 1.5:1
             if (Bid >= entryPrice + riskDist * 1.5) {
                 double trailSL = NormalizeDouble(Bid - riskDist * 0.5, Digits);
                 if (trailSL > currentSL)
-                    OrderModify(OrderTicket(), entryPrice, trailSL, currentTP, 0, clrGreen);
+                    if (!OrderModify(OrderTicket(), entryPrice, trailSL, currentTP, 0, clrGreen))
+                        Print("OrderModify (trail long) failed. Error:", GetLastError());
             }
 
         } else if (OrderType() == OP_SELL) {
@@ -407,13 +409,15 @@ void ManageTrailingStops() {
             if (Ask <= entryPrice - riskDist && currentSL > beLevel) {
                 newSL = NormalizeDouble(beLevel, Digits);
                 if (newSL < currentSL)
-                    OrderModify(OrderTicket(), entryPrice, newSL, currentTP, 0, clrOrangeRed);
+                    if (!OrderModify(OrderTicket(), entryPrice, newSL, currentTP, 0, clrOrangeRed))
+                        Print("OrderModify (BE short) failed. Error:", GetLastError());
             }
             // Phase 2: Trail stop at 50% of risk dist above price after 1.5:1
             if (Ask <= entryPrice - riskDist * 1.5) {
                 double trailSL = NormalizeDouble(Ask + riskDist * 0.5, Digits);
                 if (trailSL < currentSL)
-                    OrderModify(OrderTicket(), entryPrice, trailSL, currentTP, 0, clrOrangeRed);
+                    if (!OrderModify(OrderTicket(), entryPrice, trailSL, currentTP, 0, clrOrangeRed))
+                        Print("OrderModify (trail short) failed. Error:", GetLastError());
             }
         }
     }
