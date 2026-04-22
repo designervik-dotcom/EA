@@ -20,8 +20,12 @@
 #property version   "2.00"
 #property strict
 
-//--- Session time inputs (use your broker's server GMT offset)
-input int    InpAsianStartHour   = 22;   // Asian session start (prior day, GMT)
+//--- Broker GMT offset (CRITICAL — set this to match your broker's server time)
+// Example: if broker chart shows 10:00 when London opens at 08:00 UTC, set offset = 2
+input int    InpBrokerGMTOffset  = 2;    // Broker server GMT offset (0=GMT, 2=GMT+2, 3=GMT+3)
+
+//--- Session time inputs (in real GMT — the EA converts using InpBrokerGMTOffset)
+input int    InpAsianStartHour   = 22;   // Asian session start (GMT)
 input int    InpAsianEndHour     = 7;    // Asian session end (GMT)
 input int    InpLondonStartHour  = 7;    // London open (GMT)
 input int    InpLondonEndHour    = 12;   // London close for entries (GMT)
@@ -34,9 +38,10 @@ input double InpMaxRangePips     = 400.0; // Maximum Asian range size (pips) —
 
 //--- Trend & momentum filters
 input int    InpH4EMAPeriod      = 50;    // H4 EMA period (trend direction filter)
-input int    InpRSIPeriod        = 14;    // RSI period (overbought/oversold filter)
-input double InpRSIOverbought    = 70.0;  // Skip longs above this RSI level
-input double InpRSIOversold      = 30.0;  // Skip shorts below this RSI level
+input bool   InpUseRSIFilter     = false; // Enable RSI momentum filter (default OFF — see note)
+input int    InpRSIPeriod        = 14;    // RSI period
+input double InpRSIBullMin       = 50.0;  // Longs require RSI above this (confirms upward momentum)
+input double InpRSIBearMax       = 50.0;  // Shorts require RSI below this (confirms downward momentum)
 
 //--- Stop & target
 input int    InpATRPeriod        = 14;    // ATR period for stop distance
@@ -87,8 +92,14 @@ int OnInit() {
     g_lastDayTime    = TimeCurrent();
     g_lastWeekTime   = TimeCurrent();
 
-    Print("GoldLondonBreakout EA initialized. Symbol:", Symbol(),
-          " Digits:", Digits, " PipSize:", g_pipSize);
+    int londonBroker = (InpLondonStartHour + InpBrokerGMTOffset) % 24;
+    int asianBroker  = (InpAsianStartHour  + InpBrokerGMTOffset) % 24;
+    Print("GoldLondonBreakout initialized | Symbol:", Symbol(),
+          " Digits:", Digits, " PipSize:", g_pipSize,
+          " | GMToffset:", InpBrokerGMTOffset,
+          " | Asian start broker time:", asianBroker, ":00",
+          " | London open broker time:", londonBroker, ":00");
+    Print(">>> Check the times above match what you see on your chart clock <<<");
     return INIT_SUCCEEDED;
 }
 
@@ -195,21 +206,25 @@ bool IsWeeklyLimitHit() {
 }
 
 //+------------------------------------------------------------------+
-//| Session detection helpers                                        |
+//| Session detection — convert broker time to GMT before comparing  |
 //+------------------------------------------------------------------+
+int BrokerHourToGMT(int brokerHour) {
+    return (brokerHour - InpBrokerGMTOffset + 24) % 24;
+}
+
 bool IsAsianHour() {
-    int h = TimeHour(TimeCurrent());
-    return (h >= InpAsianStartHour || h < InpAsianEndHour);
+    int gmt = BrokerHourToGMT(TimeHour(TimeCurrent()));
+    return (gmt >= InpAsianStartHour || gmt < InpAsianEndHour);
 }
 
 bool IsLondonSession() {
-    int h = TimeHour(TimeCurrent());
-    return (h >= InpLondonStartHour && h < InpLondonEndHour);
+    int gmt = BrokerHourToGMT(TimeHour(TimeCurrent()));
+    return (gmt >= InpLondonStartHour && gmt < InpLondonEndHour);
 }
 
 bool IsNYSession() {
-    int h = TimeHour(TimeCurrent());
-    return (h >= InpNYStartHour && h < InpNYEndHour);
+    int gmt = BrokerHourToGMT(TimeHour(TimeCurrent()));
+    return (gmt >= InpNYStartHour && gmt < InpNYEndHour);
 }
 
 //+------------------------------------------------------------------+
@@ -222,7 +237,7 @@ void BuildAsianRange() {
 
     for (int i = 1; i < 300; i++) {
         datetime barTime = iTime(NULL, PERIOD_M5, i);
-        int      barHour = TimeHour(barTime);
+        int      barHour = BrokerHourToGMT(TimeHour(barTime));
 
         bool inAsian = (barHour >= InpAsianStartHour || barHour < InpAsianEndHour);
         if (!inAsian) {
@@ -246,25 +261,36 @@ void BuildAsianRange() {
 }
 
 //+------------------------------------------------------------------+
-//| H4 trend filter — price above EMA50 = bullish bias              |
+//| H4 trend filter — both price and EMA read from closed bar 1     |
 //+------------------------------------------------------------------+
 bool IsBullTrendH4() {
-    double ema   = iMA(NULL, PERIOD_H4, InpH4EMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
-    double close = iClose(NULL, PERIOD_H4, 1); // Use closed bar to avoid repainting
+    double ema   = iMA(NULL, PERIOD_H4, InpH4EMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 1);
+    double close = iClose(NULL, PERIOD_H4, 1);
     return close > ema;
 }
 
 bool IsBearTrendH4() {
-    double ema   = iMA(NULL, PERIOD_H4, InpH4EMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
+    double ema   = iMA(NULL, PERIOD_H4, InpH4EMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 1);
     double close = iClose(NULL, PERIOD_H4, 1);
     return close < ema;
 }
 
 //+------------------------------------------------------------------+
-//| RSI on H1 for overbought/oversold filter                        |
+//| RSI momentum confirmation (only used when InpUseRSIFilter=true)  |
+//| Longs require RSI > 50 (upward momentum), shorts require < 50   |
 //+------------------------------------------------------------------+
 double GetH1RSI() {
     return iRSI(NULL, PERIOD_H1, InpRSIPeriod, PRICE_CLOSE, 1);
+}
+
+bool RSIAllowsLong() {
+    if (!InpUseRSIFilter) return true;
+    return GetH1RSI() >= InpRSIBullMin;
+}
+
+bool RSIAllowsShort() {
+    if (!InpUseRSIFilter) return true;
+    return GetH1RSI() <= InpRSIBearMax;
 }
 
 //+------------------------------------------------------------------+
@@ -282,24 +308,23 @@ void CheckLongBreakout() {
     if (c1 <= o1)           return; // Must be bullish candle
 
     // Trend filter: H4 must be bullish
-    if (!IsBullTrendH4()) return;
+    if (!IsBullTrendH4()) { Print("LONG blocked: H4 trend bearish"); return; }
 
-    // Momentum filter: RSI must not be overbought
-    double rsi = GetH1RSI();
-    if (rsi >= InpRSIOverbought) return;
+    // RSI momentum filter (disabled by default)
+    if (!RSIAllowsLong()) { Print("LONG blocked: RSI=", GetH1RSI(), " below bull threshold"); return; }
 
     // ATR-based stop loss placed below the breakout candle low
     double atr    = iATR(NULL, PERIOD_H1, InpATRPeriod, 1);
     double sl     = l1 - atr * InpATRMultiplier;
     double slDist = Ask - sl;
-    if (slDist <= 0) return;
+    if (slDist <= 0) { Print("LONG blocked: slDist <= 0"); return; }
 
     // Stop should be below the Asian midpoint (confirms valid breakout)
-    if (sl >= g_asianMid) return;
+    if (sl >= g_asianMid) { Print("LONG blocked: SL above Asian mid. SL=", sl, " Mid=", g_asianMid); return; }
 
     double tp   = Ask + slDist * InpRRRatio;
     double lots = CalculateLots(slDist);
-    if (lots <= 0) return;
+    if (lots <= 0) { Print("LONG blocked: lots <= 0"); return; }
 
     int ticket = OrderSend(Symbol(), OP_BUY, lots, Ask, InpSlippage,
                            NormalizeDouble(sl, Digits),
@@ -309,7 +334,7 @@ void CheckLongBreakout() {
         g_longFired = true;
         g_tradesToday++;
         Print("LONG breakout | Entry:", Ask, " SL:", sl, " TP:", tp,
-              " Lots:", lots, " RSI:", rsi, " ATR:", atr);
+              " Lots:", lots, " RSI:", GetH1RSI(), " ATR:", atr);
     } else {
         Print("OrderSend failed. Error:", GetLastError());
     }
@@ -330,24 +355,23 @@ void CheckShortBreakout() {
     if (c1 >= o1)          return; // Must be bearish candle
 
     // Trend filter: H4 must be bearish
-    if (!IsBearTrendH4()) return;
+    if (!IsBearTrendH4()) { Print("SHORT blocked: H4 trend bullish"); return; }
 
-    // Momentum filter: RSI must not be oversold
-    double rsi = GetH1RSI();
-    if (rsi <= InpRSIOversold) return;
+    // RSI momentum filter (disabled by default)
+    if (!RSIAllowsShort()) { Print("SHORT blocked: RSI=", GetH1RSI(), " above bear threshold"); return; }
 
     // ATR-based stop loss placed above the breakout candle high
     double atr    = iATR(NULL, PERIOD_H1, InpATRPeriod, 1);
     double sl     = h1 + atr * InpATRMultiplier;
     double slDist = sl - Bid;
-    if (slDist <= 0) return;
+    if (slDist <= 0) { Print("SHORT blocked: slDist <= 0"); return; }
 
     // Stop should be above the Asian midpoint (confirms valid breakout)
-    if (sl <= g_asianMid) return;
+    if (sl <= g_asianMid) { Print("SHORT blocked: SL below Asian mid. SL=", sl, " Mid=", g_asianMid); return; }
 
     double tp   = Bid - slDist * InpRRRatio;
     double lots = CalculateLots(slDist);
-    if (lots <= 0) return;
+    if (lots <= 0) { Print("SHORT blocked: lots <= 0"); return; }
 
     int ticket = OrderSend(Symbol(), OP_SELL, lots, Bid, InpSlippage,
                            NormalizeDouble(sl, Digits),
@@ -357,7 +381,7 @@ void CheckShortBreakout() {
         g_shortFired = true;
         g_tradesToday++;
         Print("SHORT breakout | Entry:", Bid, " SL:", sl, " TP:", tp,
-              " Lots:", lots, " RSI:", rsi, " ATR:", atr);
+              " Lots:", lots, " RSI:", GetH1RSI(), " ATR:", atr);
     } else {
         Print("OrderSend failed. Error:", GetLastError());
     }
