@@ -1,93 +1,85 @@
 //+------------------------------------------------------------------+
 //|                                             ORB_Strategy.mq5     |
 //|                                                                  |
-//|  Opening Range Breakout (ORB) Expert Advisor                    |
+//|  9am Reference Candle Breakout + Retest EA (default: XAUUSD M15) |
 //|  ─────────────────────────────────────────────────────────────  |
-//|  1. Opening range: the high/low formed between InpRangeStartHour |
-//|     /Minute and (start + InpRangeMinutes) is recorded once, on   |
-//|     the entry timeframe.                                         |
-//|  2. Range-size filter: the range is only tradeable if its size   |
-//|     falls between InpMinRangeATRMult and InpMaxRangeATRMult      |
-//|     multiples of ATR – too narrow = noise, too wide = already    |
-//|     extended (poor R:R left on the table).                       |
-//|  3. Breakout: a closed candle on the entry timeframe beyond the   |
-//|     range high/low triggers a signal (close-based, not a wick    |
-//|     touch, to cut down on false breakouts).                      |
-//|  4. Confluence filters applied to every breakout signal:          |
-//|       • VWAP filter  – close must be on the correct side of the  |
-//|         session VWAP (anchored at the range start), i.e. only    |
-//|         trade breakouts that agree with the intraday trend.      |
-//|       • Volume filter – the breakout bar's tick volume must      |
-//|         exceed its recent average by InpVolumeMultiplier,        |
-//|         a proxy for real participation vs. a low-volume fakeout. |
-//|  5. Stop loss sits beyond the opposite side of the range (plus a |
-//|     fixed points buffer and an optional ATR buffer). Take profit |
-//|     is a fixed multiple of that risk (InpRRRatio), so every      |
-//|     trade carries a known, healthy reward:risk ratio.            |
-//|  6. Trading stops for the day after InpMaxTradesPerDay entries,  |
-//|     after the breakout window elapses, or at the flat time       |
-//|     (which also force-closes any open EA position).              |
+//|  1. Reference candle: the 15-minute candle opening at             |
+//|     InpRefHour:InpRefMinute (server time – set to line up with    |
+//|     9am UK on your broker's clock). Its open/close mark a body    |
+//|     zone: top = max(open,close), bottom = min(open,close),        |
+//|     centre = (open+close)/2.                                      |
+//|  2. Breakout: wait for a later M15 candle whose body closes        |
+//|     ENTIRELY beyond that zone (full body above the top, or        |
+//|     entirely below the bottom) – this sets the day's bias.        |
+//|  3. Retest entry: once the breakout is confirmed, a pending       |
+//|     limit order is placed at the near edge of the reference       |
+//|     candle's body (buy limit at the top / sell limit at the       |
+//|     bottom) so the trade fires the instant price taps back into   |
+//|     the zone – no need to wait for a candle close to react.       |
+//|  4. Stop loss: the centre of the reference candle's body.         |
+//|     Take profit: InpRRRatio x the risk distance (default 1:3).    |
+//|  5. Safety nets: cancels the pending order if price fully closes  |
+//|     back through the opposite side of the zone (setup             |
+//|     invalidated), if too long elapses waiting for a breakout or   |
+//|     a retest, or at the end-of-day cutoff – which can also flatten|
+//|     any live position so gold's overnight gaps aren't carried.    |
+//|  Only one setup (and at most one trade) is tracked per day.       |
 //+------------------------------------------------------------------+
 #property copyright ""
 #property link      ""
-#property version   "1.00"
+#property version   "2.00"
 
 #include <Trade\Trade.mqh>
 
-//--- Opening range / session
-input int    InpRangeStartHour     = 9;      // Range start hour (server time)
-input int    InpRangeStartMinute   = 30;     // Range start minute
-input int    InpRangeMinutes       = 15;     // Opening range duration (minutes)
-input int    InpBreakoutWindowMin  = 120;    // Stop taking new breakouts N minutes after range closes
-input int    InpFlatHour           = 15;     // Flatten / stop trading hour (server time)
-input int    InpFlatMinute         = 45;     // Flatten / stop trading minute
-input bool   InpCloseAtFlatTime    = true;   // Close open EA positions at flat time
+//--- Reference candle (server time – align to 9am UK on your broker)
+input int    InpRefHour            = 9;      // Reference candle hour (server time)
+input int    InpRefMinute          = 0;      // Reference candle minute (server time)
 
-//--- Entry timeframe
-input ENUM_TIMEFRAMES InpEntryTF   = PERIOD_M5; // Timeframe used to confirm breakout close
+//--- Breakout / retest waiting limits (in M15 bars, 0 = no limit)
+input int    InpMaxBreakoutWaitBars = 16;     // Give up waiting for the breakout after N M15 bars
+input int    InpMaxTapWaitBars      = 32;     // Cancel the pending retest order after N M15 bars
+input bool   InpInvalidateOnOppositeBreak = true; // Cancel pending order if price fully closes through the opposite side of the zone
 
 //--- Risk management
+input double InpRRRatio            = 3.0;    // Take profit reward:risk ratio (1:3 default)
 input double InpRiskPercent        = 1.0;    // Risk per trade (% of account balance)
-input double InpRRRatio            = 2.0;    // Take profit reward:risk ratio (e.g. 2 = 1:2)
-input double InpSLBufferPoints     = 20;     // Extra buffer beyond range added to stop loss (points)
-input bool   InpUseATRBuffer       = true;   // Add an ATR-based buffer to the stop loss
-input double InpATRBufferMult      = 0.25;   // ATR multiple added to the SL buffer
-input int    InpATRPeriod          = 14;     // ATR period
+input double InpMinStopDistance    = 0.10;   // Minimum SL distance allowed, in price units (skip near-doji reference candles)
 
-//--- Confluence filters
-input bool   InpUseVWAPFilter      = true;   // Require breakout to be on the correct side of session VWAP
-input bool   InpUseVolumeFilter    = true;   // Require breakout bar volume above its recent average
-input double InpVolumeMultiplier   = 1.5;    // Breakout bar volume must exceed avg volume * this
-input int    InpVolumeAvgPeriod    = 20;     // Bars used to compute the average volume baseline
-input bool   InpUseRangeSizeFilter = true;   // Reject opening ranges that are too small or too large
-input double InpMinRangeATRMult    = 0.20;   // Minimum range size, as a multiple of ATR
-input double InpMaxRangeATRMult    = 3.00;   // Maximum range size, as a multiple of ATR
+//--- End of day
+input bool   InpCloseAtEndOfDay    = true;   // Cancel unfilled order / close open position at cutoff
+input int    InpEndOfDayHour       = 21;     // End-of-day cutoff hour (server time)
+input int    InpEndOfDayMinute     = 0;      // End-of-day cutoff minute (server time)
 
-//--- Trade management
-input bool   InpTradeLongs         = true;   // Allow long breakouts
-input bool   InpTradeShorts        = true;   // Allow short breakouts
-input int    InpMaxTradesPerDay    = 2;      // Maximum number of entries per day
+//--- Execution
 input int    InpSlippage           = 5;      // Maximum slippage (points)
-input int    InpMagicNumber        = 20260804;
-input string InpComment            = "ORB";
+input int    InpMagicNumber        = 20260805;
+input string InpComment            = "ORB_9am";
 
 //--- Trade object
 CTrade trade;
 
-//--- ATR indicator handle
-int g_atr_handle = INVALID_HANDLE;
+//--- Day state machine
+enum EDayState
+{
+   STATE_WAIT_REF,       // Waiting for the reference candle to close
+   STATE_WAIT_BREAKOUT,  // Waiting for a full-body close beyond the reference candle
+   STATE_WAIT_TAP,       // Breakout confirmed, pending retest order live
+   STATE_DONE            // Filled, invalidated, gave up, or flattened – nothing left to do today
+};
 
-//--- Daily state
-datetime g_day_start     = 0;     // Midnight of the currently tracked trading day
-datetime g_last_bar_time = 0;     // Last seen entry-timeframe bar open time
+EDayState g_state         = STATE_WAIT_REF;
+datetime  g_day_start     = 0;
+datetime  g_last_bar_time = 0;
+datetime  g_ref_time      = 0;
 
-bool     g_range_ready = false;   // Opening range has been built for today
-bool     g_range_valid = false;   // Opening range passed the size filter
-double   g_range_high  = 0;
-double   g_range_low   = 0;
+double    g_ref_body_top  = 0;
+double    g_ref_body_bot  = 0;
+double    g_ref_center    = 0;
 
-int      g_trades_today = 0;
-bool     g_flat_done    = false;  // Flatten already executed today
+bool      g_bias_long        = false;
+ulong     g_pending_ticket   = 0;
+int       g_breakout_wait_ct = 0;
+int       g_tap_wait_ct      = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
@@ -97,15 +89,8 @@ int OnInit()
    trade.SetExpertMagicNumber(InpMagicNumber);
    trade.SetDeviationInPoints(InpSlippage);
 
-   g_atr_handle = iATR(_Symbol, InpEntryTF, InpATRPeriod);
-   if(g_atr_handle == INVALID_HANDLE)
-   {
-      Print("Failed to create ATR indicator handle. Error: ", GetLastError());
-      return INIT_FAILED;
-   }
-
-   Print("ORB_Strategy initialized | Symbol: ", _Symbol,
-         " | Entry TF: ", EnumToString(InpEntryTF));
+   Print("ORB_Strategy (9am candle) initialized | Symbol: ", _Symbol,
+         " | Reference time (server): ", InpRefHour, ":", InpRefMinute);
    return INIT_SUCCEEDED;
 }
 
@@ -114,7 +99,6 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(g_atr_handle != INVALID_HANDLE) IndicatorRelease(g_atr_handle);
    Print("ORB_Strategy stopped. Reason: ", reason);
 }
 
@@ -126,31 +110,24 @@ void OnTick()
    datetime today = GetDayStart();
    if(today != g_day_start) ResetDailyState(today);
 
-   datetime range_start       = GetTodayTime(InpRangeStartHour, InpRangeStartMinute);
-   datetime range_end         = range_start + InpRangeMinutes * 60;
-   datetime breakout_deadline = range_end + InpBreakoutWindowMin * 60;
-   datetime flat_time         = GetTodayTime(InpFlatHour, InpFlatMinute);
-   datetime now                = TimeCurrent();
-
-   //--- Flatten check runs every tick, independent of new-bar timing
-   if(InpCloseAtFlatTime && !g_flat_done && now >= flat_time)
+   //--- End-of-day cutoff runs every tick, independent of new-bar timing
+   datetime eod = GetTodayTime(InpEndOfDayHour, InpEndOfDayMinute);
+   if(InpCloseAtEndOfDay && g_state != STATE_DONE && TimeCurrent() >= eod)
    {
+      CancelPendingOrder();
       CloseAllPositions();
-      g_flat_done = true;
-      Print("Flat time reached – EA positions closed, no more entries today.");
+      g_state = STATE_DONE;
+      Print("End-of-day cutoff reached – flattened for the day.");
    }
 
-   if(!IsNewBar(InpEntryTF, g_last_bar_time)) return;
+   if(!IsNewBar(PERIOD_M15, g_last_bar_time)) return;
 
-   //--- Build the opening range once its window has closed
-   if(!g_range_ready && now >= range_end)
-      BuildOpeningRange(range_start, range_end);
-
-   //--- Look for a breakout while the range is valid and still tradeable
-   if(g_range_ready && g_range_valid && !g_flat_done &&
-      now < breakout_deadline && g_trades_today < InpMaxTradesPerDay)
+   switch(g_state)
    {
-      CheckBreakout(range_start);
+      case STATE_WAIT_REF:      ProcessWaitRef();      break;
+      case STATE_WAIT_BREAKOUT: ProcessWaitBreakout();  break;
+      case STATE_WAIT_TAP:      ProcessWaitTap();       break;
+      default: break;
    }
 }
 
@@ -159,211 +136,181 @@ void OnTick()
 //+------------------------------------------------------------------+
 void ResetDailyState(datetime today)
 {
-   g_day_start     = today;
-   g_range_ready   = false;
-   g_range_valid   = false;
-   g_range_high    = 0;
-   g_range_low     = 0;
-   g_trades_today  = 0;
-   g_flat_done     = false;
-   Print("New trading day: ", TimeToString(today, TIME_DATE), " – state reset.");
+   CancelPendingOrder(); // a stray order from a prior day's setup is stale
+
+   g_day_start        = today;
+   g_ref_time          = GetTodayTime(InpRefHour, InpRefMinute);
+   g_state             = STATE_WAIT_REF;
+   g_ref_body_top      = 0;
+   g_ref_body_bot       = 0;
+   g_ref_center         = 0;
+   g_breakout_wait_ct   = 0;
+   g_tap_wait_ct        = 0;
+
+   Print("New trading day: ", TimeToString(today, TIME_DATE),
+         " – waiting for reference candle at ", TimeToString(g_ref_time, TIME_MINUTES));
 }
 
 //+------------------------------------------------------------------+
-//| Scan the entry timeframe for bars inside [range_start, range_end)|
-//| to build the opening range, then validate its size against ATR   |
+//| Locate and record the reference candle once its interval has     |
+//| fully closed                                                      |
 //+------------------------------------------------------------------+
-void BuildOpeningRange(datetime range_start, datetime range_end)
+void ProcessWaitRef()
 {
-   double hi = -DBL_MAX, lo = DBL_MAX;
-   bool   found = false;
+   if(TimeCurrent() < g_ref_time + PeriodSeconds(PERIOD_M15)) return;
 
-   for(int i = 1; i < 2000; i++)
+   int shift = iBarShift(_Symbol, PERIOD_M15, g_ref_time, true);
+   if(shift < 0)
    {
-      datetime t = iTime(_Symbol, InpEntryTF, i);
-      if(t == 0 || t < range_start) break;
-      if(t < range_end)
-      {
-         hi = MathMax(hi, iHigh(_Symbol, InpEntryTF, i));
-         lo = MathMin(lo, iLow (_Symbol, InpEntryTF, i));
-         found = true;
-      }
-   }
-
-   if(!found)
-   {
-      Print("Opening range build failed – no bars found in the range window.");
+      Print("Reference candle not found at ", TimeToString(g_ref_time), " – still waiting.");
       return;
    }
 
-   g_range_high  = hi;
-   g_range_low   = lo;
-   g_range_ready = true;
-   g_range_valid = true;
+   double o = iOpen(_Symbol, PERIOD_M15, shift);
+   double c = iClose(_Symbol, PERIOD_M15, shift);
 
-   if(InpUseRangeSizeFilter)
-   {
-      double atr = GetATR(1);
-      double range_size = g_range_high - g_range_low;
-      if(atr <= 0 ||
-         range_size < atr * InpMinRangeATRMult ||
-         range_size > atr * InpMaxRangeATRMult)
-      {
-         g_range_valid = false;
-         Print("Opening range rejected by size filter | Range: ", range_size,
-               " | ATR: ", atr);
-      }
-   }
+   g_ref_body_top = MathMax(o, c);
+   g_ref_body_bot = MathMin(o, c);
+   g_ref_center   = (o + c) / 2.0;
+   g_state        = STATE_WAIT_BREAKOUT;
+   g_breakout_wait_ct = 0;
 
-   Print("Opening range built | High: ", g_range_high, " | Low: ", g_range_low,
-         " | Valid: ", g_range_valid);
+   Print("Reference candle marked | Open: ", o, " | Close: ", c,
+         " | Body top: ", g_ref_body_top, " | Body bottom: ", g_ref_body_bot,
+         " | Centre: ", g_ref_center);
 }
 
 //+------------------------------------------------------------------+
-//| Evaluate the last closed entry-timeframe candle for a breakout   |
+//| Wait for a subsequent M15 candle to close its full body beyond   |
+//| the reference candle's body                                       |
 //+------------------------------------------------------------------+
-void CheckBreakout(datetime range_start)
+void ProcessWaitBreakout()
 {
-   double close1 = iClose(_Symbol, InpEntryTF, 1);
+   double body_top1, body_bot1;
+   GetBody(1, body_top1, body_bot1);
 
-   if(InpTradeLongs && close1 > g_range_high)
+   bool bull_break = body_bot1 > g_ref_body_top;
+   bool bear_break = body_top1 < g_ref_body_bot;
+
+   if(bull_break || bear_break)
    {
-      if(!PassesConfluence(range_start, true)) return;
-      OpenPosition(true);
+      g_bias_long = bull_break;
+      Print("Breakout confirmed | Direction: ", g_bias_long ? "LONG" : "SHORT",
+            " | Candle body: ", body_bot1, " - ", body_top1);
+      PlaceRetestOrder();
+      return;
    }
-   else if(InpTradeShorts && close1 < g_range_low)
+
+   g_breakout_wait_ct++;
+   if(InpMaxBreakoutWaitBars > 0 && g_breakout_wait_ct >= InpMaxBreakoutWaitBars)
    {
-      if(!PassesConfluence(range_start, false)) return;
-      OpenPosition(false);
+      g_state = STATE_DONE;
+      Print("No breakout within ", InpMaxBreakoutWaitBars, " bars – giving up for today.");
    }
 }
 
 //+------------------------------------------------------------------+
-//| VWAP + volume confluence checks for a breakout in direction      |
-//| 'is_long'                                                        |
+//| While the retest order is pending: watch for invalidation, a     |
+//| wait-time-out, or a fill                                          |
 //+------------------------------------------------------------------+
-bool PassesConfluence(datetime range_start, bool is_long)
+void ProcessWaitTap()
 {
-   double close1 = iClose(_Symbol, InpEntryTF, 1);
-
-   if(InpUseVWAPFilter)
+   //--- Filled already? Nothing left to manage – SL/TP are attached to the position.
+   if(g_pending_ticket != 0 && !OrderSelect(g_pending_ticket))
    {
-      double vwap = ComputeSessionVWAP(range_start);
-      if(vwap <= 0) return false; // not enough data to trust the read
-      if(is_long  && close1 <= vwap) { Print("Breakout rejected – close below VWAP (", vwap, ")"); return false; }
-      if(!is_long && close1 >= vwap) { Print("Breakout rejected – close above VWAP (", vwap, ")"); return false; }
-   }
-
-   if(InpUseVolumeFilter)
-   {
-      double avg_vol = AverageVolume(InpVolumeAvgPeriod);
-      double vol1    = (double)iVolume(_Symbol, InpEntryTF, 1);
-      if(avg_vol <= 0 || vol1 < avg_vol * InpVolumeMultiplier)
-      {
-         Print("Breakout rejected – volume ", vol1, " below threshold (avg ", avg_vol,
-               " x ", InpVolumeMultiplier, ")");
-         return false;
-      }
-   }
-
-   return true;
-}
-
-//+------------------------------------------------------------------+
-//| Open a breakout trade with a range-based stop and fixed R:R TP   |
-//+------------------------------------------------------------------+
-void OpenPosition(bool is_long)
-{
-   double point  = _Point;
-   double buffer = InpSLBufferPoints * point;
-   if(InpUseATRBuffer) buffer += GetATR(1) * InpATRBufferMult;
-
-   bool ok = false;
-
-   if(is_long)
-   {
-      double entry = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double sl    = g_range_low - buffer;
-      double risk  = entry - sl;
-      if(risk <= 0) { Print("Long skipped – non-positive risk distance."); return; }
-      double tp    = entry + risk * InpRRRatio;
-      double lots  = CalculateLots(risk);
-      if(lots <= 0) { Print("Long skipped – lot size calculation failed."); return; }
-
-      ok = trade.Buy(lots, _Symbol, entry, sl, tp, InpComment);
-      if(ok)
-         Print("LONG opened | Entry: ", entry, " | SL: ", sl, " | TP: ", tp,
-               " | RR: 1:", InpRRRatio, " | Lots: ", lots);
+      if(HasOpenPosition())
+         Print("Retest order filled – trade is live.");
       else
-         Print("Buy failed | Error: ", GetLastError());
+         Print("Retest order no longer pending (expired/rejected) – no trade taken today.");
+      g_state = STATE_DONE;
+      return;
+   }
+
+   //--- Invalidation: price fully closed back through the opposite side of the zone
+   if(InpInvalidateOnOppositeBreak)
+   {
+      double body_top1, body_bot1;
+      GetBody(1, body_top1, body_bot1);
+      bool opposite_break = g_bias_long ? (body_top1 < g_ref_body_bot) : (body_bot1 > g_ref_body_top);
+      if(opposite_break)
+      {
+         CancelPendingOrder();
+         g_state = STATE_DONE;
+         Print("Setup invalidated – price closed through the opposite side of the zone. Order cancelled.");
+         return;
+      }
+   }
+
+   g_tap_wait_ct++;
+   if(InpMaxTapWaitBars > 0 && g_tap_wait_ct >= InpMaxTapWaitBars)
+   {
+      CancelPendingOrder();
+      g_state = STATE_DONE;
+      Print("No retest within ", InpMaxTapWaitBars, " bars – order cancelled, giving up for today.");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Place the retest limit order with SL at the reference candle's   |
+//| centre and TP at InpRRRatio x the risk distance                  |
+//+------------------------------------------------------------------+
+void PlaceRetestOrder()
+{
+   double entry = g_bias_long ? g_ref_body_top : g_ref_body_bot;
+   double sl    = g_ref_center;
+   double risk  = MathAbs(entry - sl);
+
+   if(risk < InpMinStopDistance)
+   {
+      Print("Setup skipped – stop distance ", risk, " below minimum ", InpMinStopDistance);
+      g_state = STATE_DONE;
+      return;
+   }
+
+   double tp   = g_bias_long ? entry + risk * InpRRRatio : entry - risk * InpRRRatio;
+   double lots = CalculateLots(risk);
+
+   if(lots <= 0)
+   {
+      Print("Setup skipped – lot size calculation failed.");
+      g_state = STATE_DONE;
+      return;
+   }
+
+   datetime expiration = GetTodayTime(InpEndOfDayHour, InpEndOfDayMinute);
+   bool ok;
+
+   if(g_bias_long)
+      ok = trade.BuyLimit(lots, entry, _Symbol, sl, tp, ORDER_TIME_SPECIFIED, expiration, InpComment);
+   else
+      ok = trade.SellLimit(lots, entry, _Symbol, sl, tp, ORDER_TIME_SPECIFIED, expiration, InpComment);
+
+   if(ok)
+   {
+      g_pending_ticket = trade.ResultOrder();
+      g_state          = STATE_WAIT_TAP;
+      g_tap_wait_ct     = 0;
+      Print((g_bias_long ? "BUY LIMIT" : "SELL LIMIT"), " placed | Entry: ", entry,
+            " | SL: ", sl, " | TP: ", tp, " | RR: 1:", InpRRRatio,
+            " | Lots: ", lots, " | Ticket: ", g_pending_ticket);
    }
    else
    {
-      double entry = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double sl    = g_range_high + buffer;
-      double risk  = sl - entry;
-      if(risk <= 0) { Print("Short skipped – non-positive risk distance."); return; }
-      double tp    = entry - risk * InpRRRatio;
-      double lots  = CalculateLots(risk);
-      if(lots <= 0) { Print("Short skipped – lot size calculation failed."); return; }
-
-      ok = trade.Sell(lots, _Symbol, entry, sl, tp, InpComment);
-      if(ok)
-         Print("SHORT opened | Entry: ", entry, " | SL: ", sl, " | TP: ", tp,
-               " | RR: 1:", InpRRRatio, " | Lots: ", lots);
-      else
-         Print("Sell failed | Error: ", GetLastError());
+      Print("Retest order failed | Retcode: ", trade.ResultRetcode(),
+            " | ", trade.ResultRetcodeDescription());
+      g_state = STATE_DONE;
    }
-
-   if(ok) g_trades_today++;
 }
 
 //+------------------------------------------------------------------+
-//| Session VWAP anchored at 'session_start', computed from closed   |
-//| entry-timeframe bars using typical price weighted by tick volume |
+//| Body top/bottom of the M15 candle at 'shift'                     |
 //+------------------------------------------------------------------+
-double ComputeSessionVWAP(datetime session_start)
+void GetBody(int shift, double &body_top, double &body_bot)
 {
-   double sum_pv = 0, sum_v = 0;
-
-   for(int i = 1; i < 2000; i++)
-   {
-      datetime t = iTime(_Symbol, InpEntryTF, i);
-      if(t == 0 || t < session_start) break;
-
-      double typical = (iHigh(_Symbol, InpEntryTF, i) +
-                         iLow (_Symbol, InpEntryTF, i) +
-                         iClose(_Symbol, InpEntryTF, i)) / 3.0;
-      double vol = (double)iVolume(_Symbol, InpEntryTF, i);
-
-      sum_pv += typical * vol;
-      sum_v  += vol;
-   }
-
-   if(sum_v <= 0) return 0;
-   return sum_pv / sum_v;
-}
-
-//+------------------------------------------------------------------+
-//| Average tick volume of the 'period' bars preceding the breakout  |
-//| bar (shifts 2..period+1, so the breakout bar itself is excluded) |
-//+------------------------------------------------------------------+
-double AverageVolume(int period)
-{
-   double sum = 0;
-   for(int i = 2; i < 2 + period; i++)
-      sum += (double)iVolume(_Symbol, InpEntryTF, i);
-   return sum / period;
-}
-
-//+------------------------------------------------------------------+
-//| Latest ATR value from the indicator handle                       |
-//+------------------------------------------------------------------+
-double GetATR(int shift)
-{
-   double buf[];
-   if(CopyBuffer(g_atr_handle, 0, shift, 1, buf) <= 0) return 0;
-   return buf[0];
+   double o = iOpen (_Symbol, PERIOD_M15, shift);
+   double c = iClose(_Symbol, PERIOD_M15, shift);
+   body_top = MathMax(o, c);
+   body_bot = MathMin(o, c);
 }
 
 //+------------------------------------------------------------------+
@@ -392,6 +339,20 @@ double CalculateLots(double sl_distance)
 }
 
 //+------------------------------------------------------------------+
+//| Cancel the tracked pending order, if it still exists              |
+//+------------------------------------------------------------------+
+void CancelPendingOrder()
+{
+   if(g_pending_ticket == 0) return;
+   if(OrderSelect(g_pending_ticket))
+   {
+      if(!trade.OrderDelete(g_pending_ticket))
+         Print("Failed to delete order #", g_pending_ticket, " | Error: ", GetLastError());
+   }
+   g_pending_ticket = 0;
+}
+
+//+------------------------------------------------------------------+
 //| Close every open position on this symbol opened by this EA       |
 //+------------------------------------------------------------------+
 void CloseAllPositions()
@@ -406,6 +367,22 @@ void CloseAllPositions()
       if(!trade.PositionClose(ticket))
          Print("Failed to close position #", ticket, " | Error: ", GetLastError());
    }
+}
+
+//+------------------------------------------------------------------+
+//| Returns true if the EA has an open position on this symbol       |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      return true;
+   }
+   return false;
 }
 
 //+------------------------------------------------------------------+
