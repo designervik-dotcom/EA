@@ -43,7 +43,7 @@ input bool   InpInvalidateOnOppositeBreak = true; // Cancel pending order if pri
 //--- Risk management
 input double InpRRRatio            = 3.0;    // Take profit reward:risk ratio (1:3 default)
 input double InpRiskPercent        = 1.0;    // Risk per trade (% of account balance)
-input double InpMinStopDistance    = 0.10;   // Minimum SL distance allowed, in price units (skip near-doji reference candles)
+input double InpMinStopDistance    = 1.50;   // Minimum SL distance allowed, in price units (e.g. 1.50 = $1.50 for XAUUSD; skip near-doji reference candles)
 
 //--- End of day
 input bool   InpCloseAtEndOfDay    = true;   // Cancel unfilled order / close open position at cutoff
@@ -121,6 +121,13 @@ void OnTick()
    }
 
    if(!IsNewBar(PERIOD_M15, g_last_bar_time)) return;
+
+   //--- Never stack a new setup on top of a still-open trade. This matters
+   //    whenever a trade survives past the end-of-day cutoff (or the cutoff
+   //    is disabled) so a 1:3 target has room to play out over more than
+   //    one day – without this guard, the next day's setup would open a
+   //    second position while the first is still live.
+   if(HasOpenPosition()) return;
 
    switch(g_state)
    {
@@ -316,6 +323,13 @@ void GetBody(int shift, double &body_top, double &body_bot)
 //+------------------------------------------------------------------+
 //| Calculate lot size from a fixed risk percentage                  |
 //| sl_distance – distance from entry to stop loss in price units   |
+//|                                                                    |
+//| Rejects the trade (returns 0) rather than clamping the lot size  |
+//| to the broker's min/max volume. Clamping would silently break    |
+//| the risk-% guarantee: the stop distance stays the same while the |
+//| position size gets forced up or down, so the actual dollar risk  |
+//| no longer matches InpRiskPercent – on a tight stop this can size  |
+//| up a full-size position that was only meant to risk 1%.          |
 //+------------------------------------------------------------------+
 double CalculateLots(double sl_distance)
 {
@@ -328,14 +342,35 @@ double CalculateLots(double sl_distance)
 
    if(tick_val <= 0 || tick_size <= 0) return 0;
 
-   double lots = risk_cash / (sl_distance / tick_size * tick_val);
+   double raw_lots = risk_cash / (sl_distance / tick_size * tick_val);
 
    double min_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double max_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
 
-   lots = MathFloor(lots / lot_step) * lot_step;
-   return MathMax(min_lot, MathMin(max_lot, lots));
+   if(raw_lots > max_lot)
+   {
+      Print("Trade rejected – stop distance ", sl_distance, " is too tight for ", InpRiskPercent,
+            "% risk at balance ", balance, " (would need ", raw_lots,
+            " lots, broker max is ", max_lot, "). Sizing to max_lot would over-risk this trade.");
+      return 0;
+   }
+
+   double lots = MathFloor(raw_lots / lot_step) * lot_step;
+
+   if(lots < min_lot)
+   {
+      double actual_risk = min_lot * (sl_distance / tick_size * tick_val);
+      if(actual_risk > risk_cash * 1.5)
+      {
+         Print("Trade rejected – broker minimum lot (", min_lot, ") would risk $", actual_risk,
+               ", well above the intended $", risk_cash, ".");
+         return 0;
+      }
+      lots = min_lot;
+   }
+
+   return lots;
 }
 
 //+------------------------------------------------------------------+
