@@ -3,9 +3,13 @@
 //|                                                                  |
 //|  15m Support/Resistance Break-and-Retest EA (default: XAUUSD)    |
 //|  ─────────────────────────────────────────────────────────────  |
-//|  1. Key levels: the most recently confirmed M15 swing high        |
-//|     (resistance) and swing low (support) are tracked on an       |
-//|     ongoing basis.                                                |
+//|  1. Key levels: M15 swing highs/lows over the lookback window are |
+//|     clustered into zones (pivots within InpLevelClusterATRMult x  |
+//|     ATR of each other count as the same zone). Only a zone touched|
+//|     at least InpMinTouches times qualifies as resistance/support –|
+//|     a single untested wick no longer counts as a "key level".     |
+//|     Among qualifying zones, the one with the most touches (ties   |
+//|     broken by recency) on the correct side of price is used.      |
 //|  2. Break: an M15 candle CLOSES beyond one of those levels.       |
 //|  3. Retest: price trades back to within a small tolerance of the |
 //|     broken level (checked on M5).                                 |
@@ -33,7 +37,9 @@
 
 //--- M15 key levels
 input int    InpM15PivotBars        = 5;    // M15 pivot bars each side to confirm a swing point
-input int    InpM15Lookback         = 40;   // M15 bars searched for structure
+input int    InpM15Lookback         = 150;  // M15 bars searched for structure (~1.5 days) – needs enough history to find repeat touches
+input int    InpMinTouches          = 2;    // Minimum times a zone must be touched to count as a valid key level
+input double InpLevelClusterATRMult = 0.5;  // Pivots within this many M15-ATR of each other are treated as the same zone
 
 //--- Retest / rejection timing
 input double InpRetestTolerancePoints = 50; // Tolerance for price "returning to" the broken level (points)
@@ -58,7 +64,16 @@ input int    InpMagicNumber         = 20260808;
 input string InpComment             = "SR_Retest";
 
 CTrade trade;
-int    g_atr_handle = INVALID_HANDLE;
+int    g_atr_handle     = INVALID_HANDLE; // M5 – used for the SL buffer
+int    g_atr_m15_handle = INVALID_HANDLE; // M15 – used for level-clustering tolerance
+
+//--- A clustered support/resistance zone
+struct SLevel
+{
+   double   price;      // running average price of the pivots merged into this zone
+   int      touches;    // how many pivots have merged into this zone
+   datetime last_time;  // most recent pivot time in this zone
+};
 
 enum EState { STATE_SCAN, STATE_AWAIT_RETEST, STATE_AWAIT_REJECTION };
 EState g_state = STATE_SCAN;
@@ -85,7 +100,14 @@ int OnInit()
    g_atr_handle = iATR(_Symbol, PERIOD_M5, InpATRPeriod);
    if(g_atr_handle == INVALID_HANDLE)
    {
-      Print("Failed to create ATR indicator handle. Error: ", GetLastError());
+      Print("Failed to create M5 ATR indicator handle. Error: ", GetLastError());
+      return INIT_FAILED;
+   }
+
+   g_atr_m15_handle = iATR(_Symbol, PERIOD_M15, InpATRPeriod);
+   if(g_atr_m15_handle == INVALID_HANDLE)
+   {
+      Print("Failed to create M15 ATR indicator handle. Error: ", GetLastError());
       return INIT_FAILED;
    }
 
@@ -99,6 +121,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    if(g_atr_handle != INVALID_HANDLE) IndicatorRelease(g_atr_handle);
+   if(g_atr_m15_handle != INVALID_HANDLE) IndicatorRelease(g_atr_m15_handle);
    Print("SR_BreakRetest_EA stopped. Reason: ", reason);
 }
 
@@ -125,14 +148,107 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Refresh the most recent confirmed M15 swing high/low             |
+//| Refresh resistance/support from clustered, multi-touch M15 zones |
+//| instead of just the single latest pivot – a level only counts if |
+//| price has actually reacted from that area more than once.        |
 //+------------------------------------------------------------------+
 void UpdateKeyLevels()
 {
-   double sh = FindSwingHigh(PERIOD_M15, InpM15Lookback, InpM15PivotBars);
-   double sl = FindSwingLow (PERIOD_M15, InpM15Lookback, InpM15PivotBars);
-   if(sh > 0) g_resistance = sh;
-   if(sl > 0) g_support    = sl;
+   double tol = InpLevelClusterATRMult * GetATR(g_atr_m15_handle);
+   if(tol <= 0) return; // not enough ATR history yet
+
+   SLevel highs[], lows[];
+   CollectLevelClusters(true,  tol, highs);
+   CollectLevelClusters(false, tol, lows);
+
+   double current = iClose(_Symbol, PERIOD_M15, 1);
+   double new_res  = PickLevel(highs, true,  current);
+   double new_sup  = PickLevel(lows,  false, current);
+
+   if(new_res > 0) g_resistance = new_res;
+   if(new_sup > 0) g_support    = new_sup;
+}
+
+//+------------------------------------------------------------------+
+//| Scan the M15 lookback for confirmed pivots and merge any within  |
+//| 'tol' of an existing zone into it (running-average price,        |
+//| incremented touch count, most recent touch time)                  |
+//+------------------------------------------------------------------+
+void CollectLevelClusters(bool want_high, double tol, SLevel &levels[])
+{
+   ArrayResize(levels, 0);
+   int n = InpM15PivotBars;
+
+   for(int i = n + 1; i <= InpM15Lookback - n; i++)
+   {
+      double price = want_high ? iHigh(_Symbol, PERIOD_M15, i) : iLow(_Symbol, PERIOD_M15, i);
+      bool   ok = true;
+      for(int j = 1; j <= n && ok; j++)
+      {
+         if(want_high)
+         {
+            if(iHigh(_Symbol, PERIOD_M15, i - j) >= price) ok = false;
+            if(iHigh(_Symbol, PERIOD_M15, i + j) >= price) ok = false;
+         }
+         else
+         {
+            if(iLow(_Symbol, PERIOD_M15, i - j) <= price) ok = false;
+            if(iLow(_Symbol, PERIOD_M15, i + j) <= price) ok = false;
+         }
+      }
+      if(!ok) continue;
+
+      datetime t = iTime(_Symbol, PERIOD_M15, i);
+
+      int match = -1;
+      for(int k = 0; k < ArraySize(levels); k++)
+      {
+         if(MathAbs(levels[k].price - price) <= tol) { match = k; break; }
+      }
+
+      if(match >= 0)
+      {
+         levels[match].price = (levels[match].price * levels[match].touches + price) / (levels[match].touches + 1);
+         levels[match].touches++;
+         if(t > levels[match].last_time) levels[match].last_time = t;
+      }
+      else
+      {
+         int sz = ArraySize(levels);
+         ArrayResize(levels, sz + 1);
+         levels[sz].price     = price;
+         levels[sz].touches   = 1;
+         levels[sz].last_time = t;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Pick the strongest qualifying zone on the correct side of price: |
+//| most touches first, ties broken by the most recent touch. Zones  |
+//| below InpMinTouches don't qualify as a key level at all.         |
+//+------------------------------------------------------------------+
+double PickLevel(SLevel &levels[], bool above_price, double current_price)
+{
+   double   best_price   = 0;
+   int      best_touches = 0;
+   datetime best_time     = 0;
+
+   for(int k = 0; k < ArraySize(levels); k++)
+   {
+      if(levels[k].touches < InpMinTouches) continue;
+      if(above_price  && levels[k].price <= current_price) continue;
+      if(!above_price && levels[k].price >= current_price) continue;
+
+      if(levels[k].touches > best_touches ||
+         (levels[k].touches == best_touches && levels[k].last_time > best_time))
+      {
+         best_touches = levels[k].touches;
+         best_price   = levels[k].price;
+         best_time    = levels[k].last_time;
+      }
+   }
+   return best_price;
 }
 
 //+------------------------------------------------------------------+
@@ -258,7 +374,7 @@ void CheckRejection()
 void OpenTrade(bool is_long, double entry_candle_extreme)
 {
    double buffer = InpSLBufferPoints * _Point;
-   if(InpUseATRBuffer) buffer += GetATR() * InpATRBufferMult;
+   if(InpUseATRBuffer) buffer += GetATR(g_atr_handle) * InpATRBufferMult;
 
    bool ok = false;
 
@@ -306,47 +422,12 @@ void OpenTrade(bool is_long, double entry_candle_extreme)
 }
 
 //+------------------------------------------------------------------+
-//| Confirmed swing HIGH/LOW finder                                   |
+//| Latest closed-bar ATR value from the given indicator handle       |
 //+------------------------------------------------------------------+
-double FindSwingHigh(ENUM_TIMEFRAMES tf, int lookback, int n)
-{
-   for(int i = n + 1; i <= lookback - n; i++)
-   {
-      double h = iHigh(_Symbol, tf, i);
-      bool   ok = true;
-      for(int j = 1; j <= n && ok; j++)
-      {
-         if(iHigh(_Symbol, tf, i - j) >= h) ok = false;
-         if(iHigh(_Symbol, tf, i + j) >= h) ok = false;
-      }
-      if(ok) return h;
-   }
-   return 0;
-}
-
-double FindSwingLow(ENUM_TIMEFRAMES tf, int lookback, int n)
-{
-   for(int i = n + 1; i <= lookback - n; i++)
-   {
-      double l = iLow(_Symbol, tf, i);
-      bool   ok = true;
-      for(int j = 1; j <= n && ok; j++)
-      {
-         if(iLow(_Symbol, tf, i - j) <= l) ok = false;
-         if(iLow(_Symbol, tf, i + j) <= l) ok = false;
-      }
-      if(ok) return l;
-   }
-   return 0;
-}
-
-//+------------------------------------------------------------------+
-//| Latest closed-bar ATR value (M5)                                  |
-//+------------------------------------------------------------------+
-double GetATR()
+double GetATR(int handle)
 {
    double buf[];
-   if(CopyBuffer(g_atr_handle, 0, 1, 1, buf) <= 0) return 0;
+   if(CopyBuffer(handle, 0, 1, 1, buf) <= 0) return 0;
    return buf[0];
 }
 
