@@ -33,8 +33,12 @@ if isNewHtfBar
     label.delete(openLbl)
     label.delete(closeLbl)
 
-    openLine  := line.new(bar_index, htfOpen, bar_index, htfOpen, extend=extend.right, color=openColor, style=line.style_dotted, width=lineWidth)
-    closeLine := line.new(bar_index, htfClose, bar_index, htfClose, extend=extend.right, color=closeColor, style=line.style_dotted, width=lineWidth)
+    // x1/x2 must be two different bars (both at the same price) so the line
+    // has a well-defined horizontal slope - if x1 equals x2, TradingView
+    // treats it as a single point and "extend" renders it as a vertical
+    // tick instead of a horizontal ray.
+    openLine  := line.new(bar_index - 1, htfOpen, bar_index, htfOpen, extend=extend.right, color=openColor, style=line.style_dotted, width=lineWidth)
+    closeLine := line.new(bar_index - 1, htfClose, bar_index, htfClose, extend=extend.right, color=closeColor, style=line.style_dotted, width=lineWidth)
 
     if showLabels
         openLbl  := label.new(bar_index, htfOpen, "Prev Open " + str.tostring(htfOpen, format.mintick), style=label.style_label_left, textcolor=openColor, color=color.new(color.black, 100), size=size.small)
