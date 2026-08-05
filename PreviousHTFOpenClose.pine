@@ -1,0 +1,53 @@
+//+------------------------------------------------------------------+
+//|                                    PreviousHTFOpenClose.pine     |
+//|                                                                  |
+//|  Plots dotted horizontal lines at the OPEN and CLOSE price of    |
+//|  the previous completed 1H (or 4H) candle. Each line segment     |
+//|  spans the duration of the higher-timeframe candle it belongs    |
+//|  to, and a new pair of lines is drawn every time a new HTF       |
+//|  candle closes.                                                  |
+//+------------------------------------------------------------------+
+//@version=5
+indicator("Previous HTF Open/Close", shorttitle="Prev HTF O/C", overlay=true, max_lines_count=500, max_labels_count=500)
+
+tfInput      = input.timeframe("60", title="Higher Timeframe", options=["60", "240"])
+openColor    = input.color(#2962FF, title="Open Line Color")
+closeColor   = input.color(#FF6D00, title="Close Line Color")
+lineWidth    = input.int(1, title="Line Width", minval=1, maxval=4)
+showLabels   = input.bool(true, title="Show Price Labels")
+
+// Previous (fully closed) HTF candle's open, close, and bar time
+[htfOpen, htfClose, htfTime] = request.security(syminfo.tickerid, tfInput, [open[1], close[1], time], lookahead=barmerge.lookahead_off)
+
+var line  openLine  = na
+var line  closeLine = na
+var label openLbl   = na
+var label closeLbl  = na
+
+isNewHtfBar = htfTime != htfTime[1]
+
+if isNewHtfBar
+    // Freeze the previous segment where the new HTF candle begins
+    if not na(openLine)
+        line.set_extend(openLine, extend.none)
+        line.set_x2(openLine, bar_index)
+    if not na(closeLine)
+        line.set_extend(closeLine, extend.none)
+        line.set_x2(closeLine, bar_index)
+
+    openLine  := line.new(bar_index, htfOpen, bar_index, htfOpen, extend=extend.right, color=openColor, style=line.style_dotted, width=lineWidth)
+    closeLine := line.new(bar_index, htfClose, bar_index, htfClose, extend=extend.right, color=closeColor, style=line.style_dotted, width=lineWidth)
+
+    if not na(openLbl)
+        label.delete(openLbl)
+    if not na(closeLbl)
+        label.delete(closeLbl)
+
+    if showLabels
+        openLbl  := label.new(bar_index, htfOpen, "O " + str.tostring(htfOpen, format.mintick), style=label.style_label_left, textcolor=openColor, color=color.new(color.black, 100), size=size.small)
+        closeLbl := label.new(bar_index, htfClose, "C " + str.tostring(htfClose, format.mintick), style=label.style_label_left, textcolor=closeColor, color=color.new(color.black, 100), size=size.small)
+else if showLabels
+    if not na(openLbl)
+        label.set_x(openLbl, bar_index)
+    if not na(closeLbl)
+        label.set_x(closeLbl, bar_index)
