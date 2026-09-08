@@ -2,7 +2,7 @@
 //|                                    PreviousHTFOpenClose.pine     |
 //|                                                                  |
 //|  Plots exactly 2 dotted lines: the OPEN and CLOSE of the single  |
-//|  most recently completed 1H (or 4H) candle. Only the latest      |
+//|  most recently completed 15m, 1H, or 4H candle. Only the latest  |
 //|  candle is considered - as soon as a new higher-timeframe        |
 //|  candle closes, the old lines are deleted and replaced. Nothing  |
 //|  from earlier candles is kept on the chart.                      |
@@ -10,7 +10,7 @@
 //@version=5
 indicator("Previous HTF Open/Close", shorttitle="Prev HTF O/C", overlay=true, max_lines_count=2, max_labels_count=2)
 
-tfInput    = input.timeframe("60", title="Higher Timeframe", options=["60", "240"])
+tfInput    = input.timeframe("60", title="Higher Timeframe", options=["15", "60", "240"])
 openColor  = input.color(#2962FF, title="Open Line Color")
 closeColor = input.color(#FF6D00, title="Close Line Color")
 lineWidth  = input.int(1, title="Line Width", minval=1, maxval=4)
